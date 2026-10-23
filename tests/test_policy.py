@@ -109,7 +109,7 @@ def test_evaluate_and_dispatch_fail_closed(policy_gate, mock_adapter):
         arguments={"host": "srv-pay-prod-02"},
         reason="Adversarial command"
     )
-    decision, result = policy_gate.evaluate_and_dispatch(action, mock_adapter, approval_granted=False)
+    decision, result, _dlp = policy_gate.evaluate_and_dispatch(action, mock_adapter, approval_granted=False)
     assert decision.decision == PolicyDecisionStatus.DENY
     assert result.executed is False
     assert result.status == "blocked"
@@ -124,7 +124,7 @@ def test_evaluate_and_dispatch_allowed_action(policy_gate, mock_adapter):
         arguments={"title": "Investigate credential breach", "priority": "high"},
         reason="Create tracking ticket"
     )
-    decision, result = policy_gate.evaluate_and_dispatch(action, mock_adapter)
+    decision, result, _dlp = policy_gate.evaluate_and_dispatch(action, mock_adapter)
     assert decision.decision == PolicyDecisionStatus.ALLOW
     assert result.executed is True
     assert result.status == "success"
@@ -205,13 +205,13 @@ def test_approval_token_consumed_cannot_be_replayed(policy_gate, mock_adapter):
         reason="First isolation attempt"
     )
     # First dispatch consumes the token
-    decision1, res1 = policy_gate.evaluate_and_dispatch(action, mock_adapter, approval=single_use_token)
+    decision1, res1, _dlp1 = policy_gate.evaluate_and_dispatch(action, mock_adapter, approval=single_use_token)
     assert decision1.decision == PolicyDecisionStatus.ALLOW
     assert res1.executed is True
     assert single_use_token.consumed is True
 
     # Replay attempt with same token must be rejected
-    decision2, res2 = policy_gate.evaluate_and_dispatch(action, mock_adapter, approval=single_use_token)
+    decision2, res2, _dlp2 = policy_gate.evaluate_and_dispatch(action, mock_adapter, approval=single_use_token)
     assert decision2.decision == PolicyDecisionStatus.DENY
     assert decision2.policy_rule_id == "RULE-APPROVAL-ALREADY-CONSUMED"
     assert res2.executed is False

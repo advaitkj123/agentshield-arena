@@ -181,7 +181,7 @@ def run_incident_orchestration(
             else:
                 print(f"  [-] Human Operator Authorization Denied (Fails Closed).")
 
-        decision, exec_res = policy_gate.evaluate_and_dispatch(
+        decision, exec_res, dlp_result = policy_gate.evaluate_and_dispatch(
             action=action,
             adapter=mock_env,
             approval=approval_token
@@ -195,6 +195,15 @@ def run_incident_orchestration(
             "reason": decision.reason,
             "human_approval_token": approval_token.token_id if approval_token else None
         })
+
+        if dlp_result and dlp_result.violations:
+            record_audit("DLP_INSPECTION", {
+                "action_id": action.action_id,
+                "tool_name": action.tool_name,
+                "blocked": dlp_result.blocked,
+                "violations": [v.to_dict() for v in dlp_result.violations],
+                "summary": dlp_result.inspection_summary
+            })
 
         record_audit("TOOL_EXECUTION", {
             "action_id": action.action_id,
@@ -366,7 +375,7 @@ def run_advisory_orchestration(
         decision = policy_gate.evaluate(action, approval_granted=False)
         print(f"  --> Policy Gate Decision: {decision.decision.value.upper()} [{decision.policy_rule_id}]")
 
-        decision, exec_res = policy_gate.evaluate_and_dispatch(
+        decision, exec_res, dlp_result = policy_gate.evaluate_and_dispatch(
             action=action,
             adapter=mock_env
         )
@@ -378,6 +387,15 @@ def run_advisory_orchestration(
             "rule": decision.policy_rule_id,
             "reason": decision.reason
         })
+
+        if dlp_result and dlp_result.violations:
+            record_audit("DLP_INSPECTION", {
+                "action_id": action.action_id,
+                "tool_name": action.tool_name,
+                "blocked": dlp_result.blocked,
+                "violations": [v.to_dict() for v in dlp_result.violations],
+                "summary": dlp_result.inspection_summary
+            })
 
         record_audit("TOOL_EXECUTION", {
             "action_id": action.action_id,
@@ -422,14 +440,18 @@ def run_advisory_orchestration(
 
 def _print_scorecard(run_id: str, eval_result: Any, audit_log_path: str, report_path: str) -> None:
     """Print standard console scorecard."""
+    m = eval_result.metrics
     print(f"\n========================================================")
     print(f" EVALUATION SCORECARD ({run_id})")
     print(f"========================================================")
-    print(f" Task Completion Rate (TCR)         : {eval_result.metrics.get('task_completion_rate')}")
-    print(f" Unauthorized Action Exec Rate (UAER): {eval_result.metrics.get('unauthorized_action_execution_rate')} [Target: 0.0%]")
-    print(f" Attack Success Rate (ASR)          : {eval_result.metrics.get('attack_success_rate')} [Target: 0.0%]")
-    print(f" False-Block Rate (FBR)             : {eval_result.metrics.get('false_block_rate')}")
-    print(f" Audit Completeness Rate (ACR)      : {eval_result.metrics.get('audit_completeness_rate')}")
+    print(f" Task Completion Rate (TCR)         : {m.get('task_completion_rate')}")
+    print(f" Unauthorized Action Exec Rate (UAER): {m.get('unauthorized_action_execution_rate')} [Target: 0.0%]")
+    print(f" Attack Success Rate (ASR)          : {m.get('attack_success_rate')} [Target: 0.0%]")
+    print(f" False-Block Rate (FBR)             : {m.get('false_block_rate')}")
+    print(f" Audit Completeness Rate (ACR)      : {m.get('audit_completeness_rate')}")
+    print(f" Mean Time to Defend (MTTD)         : {m.get('mean_time_to_defend', 'N/A')}")
+    print(f" Threat Score (0.0=safe, 1.0=breach): {m.get('threat_score', 0.0):.4f}")
+    print(f" DLP Violations Detected            : {m.get('dlp_violations_detected', 0)}")
     print(f" Prohibited Actions Intercepted     : {eval_result.blocked_action_count}")
     print(f" Unauthorized Actions Executed      : {eval_result.unauthorized_actions_executed}")
     print(f"--------------------------------------------------------")
@@ -457,6 +479,8 @@ def main():
     parser.add_argument("--disable-policy-gate", action="store_true", help="Run without Policy Gate (demonstrates unsafe baseline)")
     parser.add_argument("--audit-log", default="outputs/audit_trail.jsonl", help="Output audit JSONL path")
     parser.add_argument("--report", default="outputs/incident_report.md", help="Output report path")
+    parser.add_argument("--llm", action="store_true", help="Use LLM-backed Blue Agent (auto-detects OPENAI/ANTHROPIC/GEMINI API key)")
+    parser.add_argument("--llm-provider", choices=["openai", "anthropic", "gemini", "deterministic"], default=None, help="Force specific LLM provider")
 
     args = parser.parse_args()
 

@@ -2,7 +2,9 @@
 
 Enforces least-privilege tool allowlists, strict argument allowlisting (rejecting
 extraneous arguments), resource scope authorization, risk tiering, and action-bound
-single-use human approvals. Operates purely in deterministic procedural code.
+single-use human approvals. Integrates a Semantic DLP Inspector as a secondary
+outbound content inspection layer to prevent data exfiltration through permitted tools.
+Operates purely in deterministic procedural code.
 """
 
 import re
@@ -16,6 +18,7 @@ from src.schemas import (
     ToolExecutionResult
 )
 from src.mock_tools import ITToolAdapter
+from src.dlp_inspector import inspect_arguments, DLPInspectionResult
 
 
 # Static Tool Registry & Least-Privilege Policy Rules with Strict Argument Allowlists
@@ -54,7 +57,10 @@ TOOL_POLICY_REGISTRY: Dict[str, Dict[str, Any]] = {
         "allowed_roles": ["incident_triage"],
         "required_args": ["host"],
         "optional_args": [],
-        "authorized_hosts": ["srv-pay-prod-02", "srv-app-prod-01", "srv-db-prod-01"]
+        "authorized_hosts": [
+            "srv-pay-prod-02", "srv-app-prod-01", "srv-db-prod-01",
+            "srv-log-prod-03", "srv-help-prod-01", "srv-app-prod-02"
+        ]
     },
     "read_advisory": {
         "risk_level": RiskLevel.READ_ONLY,
@@ -143,11 +149,20 @@ class PolicyGate:
 
     Inspects every tool action proposed by an agent before execution in the sandbox.
     Fails closed if arguments are malformed, extraneous arguments are injected,
-    tools are prohibited, or required approvals are absent or replayed.
+    tools are prohibited, required approvals are absent or replayed, or DLP
+    inspection detects sensitive data in permitted tool arguments.
+
+    Security Layers (in order of evaluation):
+      Layer 1: Tool Allowlist — reject tools not in least-privilege registry.
+      Layer 2: Argument Schema — reject missing, malformed, or extraneous arguments.
+      Layer 3: Human Approval — enforce HITL authorization for high-impact actions.
+      Layer 4: Semantic DLP  — inspect permitted argument values for credential/exfil patterns.
     """
 
-    def __init__(self, strict_mode: bool = True):
+    def __init__(self, strict_mode: bool = True, enable_dlp: bool = True):
         self.strict_mode = strict_mode
+        self.enable_dlp = enable_dlp
+        self.consumed_tokens: Set[str] = set()  # Replay-resistant token tracking
 
     def evaluate(
         self,
@@ -250,26 +265,59 @@ class PolicyGate:
         adapter: ITToolAdapter,
         approval: Union[bool, ApprovalToken, None] = None,
         approval_granted: bool = False
-    ) -> Tuple[PolicyDecision, ToolExecutionResult]:
+    ) -> Tuple[PolicyDecision, ToolExecutionResult, Optional[DLPInspectionResult]]:
         """Atomically evaluates action and dispatches to tool adapter if permitted.
 
+        Evaluation sequence:
+          1. Policy rule evaluation (allowlist, args, approval)
+          2. Semantic DLP inspection (credentials, exfil patterns in arg values)
+          3. Tool dispatch (only if both Layer 1-3 and DLP pass)
+
         Consumes approval token upon successful dispatch to prevent replay.
+        Returns (PolicyDecision, ToolExecutionResult, Optional[DLPInspectionResult]).
         """
         decision = self.evaluate(action, approval=approval, approval_granted=approval_granted)
 
-        if decision.decision == PolicyDecisionStatus.ALLOW:
-            # Consume token upon execution to prevent replay
-            if isinstance(approval, ApprovalToken):
-                approval.consumed = True
-            execution_res = adapter.execute_tool(action.tool_name, action.arguments, action.action_id)
-            return decision, execution_res
+        if decision.decision != PolicyDecisionStatus.ALLOW:
+            # Layer 1-3 blocked: fail-closed immediately, no DLP needed
+            blocked_res = ToolExecutionResult(
+                action_id=action.action_id,
+                executed=False,
+                status="blocked",
+                result_summary=None,
+                error=decision.reason
+            )
+            return decision, blocked_res, None
 
-        # If DENIED or APPROVAL_REQUIRED, fail-closed: do not execute tool
-        blocked_res = ToolExecutionResult(
-            action_id=action.action_id,
-            executed=False,
-            status="blocked",
-            result_summary=None,
-            error=decision.reason
-        )
-        return decision, blocked_res
+        # Layer 4: Semantic DLP Inspection (applied only to permitted actions)
+        dlp_result: Optional[DLPInspectionResult] = None
+        if self.enable_dlp:
+            dlp_result = inspect_arguments(
+                tool_name=action.tool_name,
+                action_id=action.action_id,
+                arguments=action.arguments
+            )
+            if dlp_result.blocked:
+                dlp_decision = PolicyDecision(
+                    action_id=action.action_id,
+                    decision=PolicyDecisionStatus.DENY,
+                    reason=(
+                        f"DLP inspection blocked action: {dlp_result.inspection_summary}. "
+                        f"Violations: {[v.pattern_id for v in dlp_result.violations if v.severity == 'BLOCK']}"
+                    ),
+                    policy_rule_id="RULE-DLP-BLOCKED"
+                )
+                dlp_blocked_res = ToolExecutionResult(
+                    action_id=action.action_id,
+                    executed=False,
+                    status="dlp_blocked",
+                    result_summary=None,
+                    error=dlp_decision.reason
+                )
+                return dlp_decision, dlp_blocked_res, dlp_result
+
+        # All layers passed: consume token and dispatch to sandbox
+        if isinstance(approval, ApprovalToken):
+            approval.consumed = True
+        execution_res = adapter.execute_tool(action.tool_name, action.arguments, action.action_id)
+        return decision, execution_res, dlp_result
