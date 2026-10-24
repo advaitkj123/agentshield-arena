@@ -1,34 +1,38 @@
-"""AgentShield Arena — Interactive Web Dashboard.
+"""AgentShield Arena — FastAPI JSON API.
 
-A self-contained FastAPI + HTML/CSS/JS web dashboard for real-time monitoring,
-scenario execution, and post-mortem review of AgentShield Arena runs.
+Pure JSON/SSE backend for the React + shadcn/ui frontend (agentshield-arena/frontend).
+No embedded HTML — the dashboard and landing page are a separate built SPA,
+served as static files when present (frontend/dist), with the Vite dev
+server proxying /api during development.
 
 Features:
-  - Real-time live execution of incident and advisory scenarios
-  - Live streaming of audit events (Server-Sent Events)
-  - Policy Gate decision visualization with color-coded outcomes
-  - DLP violation alerts with pattern details
-  - Human-in-the-Loop approval interface
-  - Interactive metrics dashboard with radar charts
-  - Structured Audit Trail browser with filtering
-  - Multi-scenario benchmarking with comparative charts
+  - Real-time live execution of incident and advisory scenarios (SSE events
+    are pushed the instant they're recorded, not replayed after the run ends)
+  - Working Human-in-the-Loop approval (the run actually blocks and resumes)
+  - Policy Gate decision visualization, DLP inspection, audit trail browsing
+  - Multi-scenario benchmarking as a background job with progress polling
+  - GraphSAGE-style attack-graph risk scoring + 3D visualization data
+  - Attack replay timeline data and a policy-gate what-if simulator
+  - Auto-generated executive incident reports
 
 Usage:
-    pip install fastapi uvicorn
+    pip install -r requirements.txt
     python src/dashboard.py
 
-Then open: http://localhost:8000
+Then open: http://localhost:8000 (serves the built frontend if present)
+or run `npm run dev` in frontend/ for the dev server at http://localhost:5173
 """
 
+import copy
 import json
+import logging
 import os
 import sys
+import time
 import uuid
 import asyncio
-import queue
 import threading
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -41,9 +45,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 try:
-    from fastapi import FastAPI, Request, HTTPException
-    from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+    from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
+    from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
     from fastapi.staticfiles import StaticFiles
+    from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
     FASTAPI_AVAILABLE = True
 except ImportError:
@@ -51,1816 +56,794 @@ except ImportError:
     print("[-] FastAPI not installed. Run: pip install fastapi uvicorn")
     sys.exit(1)
 
+from src.schemas import ApprovalToken
+
+logger = logging.getLogger("agentshield.dashboard")
+
 
 # ── App Setup ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="AgentShield Arena",
     description="Adversarially Resilient AI Security Platform",
-    version="2.0.0"
+    version="3.0.0"
 )
 
-# Serve hero images as static files
-_hero_dir = os.path.join(os.path.dirname(__file__), "..", "hero")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve hero images as static files — used by the landing page's scroll-scrubbed
+# canvas animation (frames: hero/gemini_generated_video_8435859a_000/*.jpg).
+_hero_dir = os.path.join(PROJECT_ROOT, "hero")
 if os.path.isdir(_hero_dir):
     app.mount("/hero", StaticFiles(directory=_hero_dir), name="hero")
 
-# In-memory event streams (per run_id → queue of SSE events)
-_event_queues: Dict[str, queue.Queue] = {}
-_run_results: Dict[str, Dict[str, Any]] = {}
-
-
-# ── HTML Dashboard Page ──────────────────────────────────────────────────────
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>AgentShield Arena — Security Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"/>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <style>
-    :root {
-      --bg-primary: #000;
-      --bg-secondary: #0d0d0d;
-      --bg-card: #111;
-      --bg-card-hover: #161616;
-      --border: rgba(255,255,255,0.08);
-      --accent-blue: #2997ff;
-      --accent-cyan: #06b6d4;
-      --accent-green: #30d158;
-      --accent-red: #ff453a;
-      --accent-orange: #ff9f0a;
-      --accent-purple: #bf5af2;
-      --text-primary: #f5f5f7;
-      --text-secondary: #86868b;
-      --text-muted: #424245;
-      --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
-      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-      --radius: 14px;
-      --radius-sm: 10px;
-      --shadow: 0 4px 32px rgba(0,0,0,0.7);
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: var(--font-sans);
-      background: var(--bg-primary);
-      color: var(--text-primary);
-      min-height: 100vh;
-    }
-    /* ── Header ── */
-    .header {
-      background: rgba(0,0,0,0.85);
-      border-bottom: 1px solid var(--border);
-      padding: 0 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      height: 52px;
-      position: sticky;
-      top: 0;
-      z-index: 100;
-      backdrop-filter: saturate(180%) blur(20px);
-      -webkit-backdrop-filter: saturate(180%) blur(20px);
-    }
-    .header-logo {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      text-decoration: none;
-    }
-    .shield-icon {
-      width: 30px; height: 30px;
-      background: linear-gradient(135deg, #2997ff, #06b6d4);
-      border-radius: 8px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 15px;
-    }
-    .header-title { font-size: 15px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.3px; }
-    .header-subtitle { font-size: 11px; color: var(--text-secondary); }
-    .header-badge {
-      background: rgba(48,209,88,0.12);
-      border: 1px solid rgba(48,209,88,0.3);
-      border-radius: 20px;
-      padding: 4px 12px;
-      font-size: 11px;
-      font-weight: 600;
-      color: #30d158;
-      letter-spacing: 0.04em;
-    }
-    .header-right { display:flex; align-items:center; gap:12px; }
-    .header-home-link { font-size:13px; color:var(--text-secondary); text-decoration:none; transition:color 0.2s; }
-    .header-home-link:hover { color:#2997ff; }
-    /* ── Layout ── */
-    .main-layout {
-      display: grid;
-      grid-template-columns: 260px 1fr;
-      height: calc(100vh - 52px);
-    }
-    /* ── Sidebar ── */
-    .sidebar {
-      background: var(--bg-secondary);
-      border-right: 1px solid var(--border);
-      padding: 20px 16px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .sidebar-section-label {
-      font-size: 10px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--text-muted);
-      padding: 12px 8px 6px;
-    }
-    .nav-item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
-      border-radius: var(--radius-sm);
-      cursor: pointer;
-      transition: all 0.15s;
-      font-size: 14px;
-      font-weight: 500;
-      color: var(--text-secondary);
-      text-decoration: none;
-      border: 1px solid transparent;
-    }
-    .nav-item:hover { background: var(--bg-card); color: var(--text-primary); }
-    .nav-item.active {
-      background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(139,92,246,0.1));
-      border-color: rgba(59,130,246,0.3);
-      color: var(--accent-blue);
-    }
-    .nav-icon { width: 18px; text-align: center; }
-    /* ── Content Area ── */
-    .content {
-      overflow-y: auto;
-      padding: 28px 32px;
-      display: flex;
-      flex-direction: column;
-      gap: 24px;
-    }
-    /* ── Section Header ── */
-    .section-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 4px;
-    }
-    .section-title {
-      font-size: 20px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .section-subtitle { font-size: 14px; color: var(--text-secondary); margin-top: 4px; }
-    /* ── Cards ── */
-    .card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 20px;
-      box-shadow: var(--shadow);
-    }
-    .card-title {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-bottom: 12px;
-    }
-    /* ── Metrics Grid ── */
-    .metrics-grid {
-      display: grid;
-      grid-template-columns: repeat(5, 1fr);
-      gap: 16px;
-    }
-    .metric-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 20px;
-      text-align: center;
-      position: relative;
-      overflow: hidden;
-      transition: transform 0.2s, border-color 0.2s;
-    }
-    .metric-card::before {
-      content: '';
-      position: absolute;
-      top: 0; left: 0; right: 0;
-      height: 3px;
-    }
-    .metric-card.green::before { background: var(--accent-green); }
-    .metric-card.blue::before { background: var(--accent-blue); }
-    .metric-card.red::before { background: var(--accent-red); }
-    .metric-card.orange::before { background: var(--accent-orange); }
-    .metric-card.purple::before { background: var(--accent-purple); }
-    .metric-card:hover { transform: translateY(-2px); border-color: rgba(59,130,246,0.4); }
-    .metric-label { font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
-    .metric-value { font-size: 32px; font-weight: 700; font-family: var(--font-mono); }
-    .metric-value.green { color: var(--accent-green); }
-    .metric-value.blue { color: var(--accent-blue); }
-    .metric-value.red { color: var(--accent-red); }
-    .metric-value.orange { color: var(--accent-orange); }
-    .metric-value.purple { color: var(--accent-purple); }
-    .metric-target { font-size: 10px; color: var(--text-muted); margin-top: 6px; }
-    /* ── Control Panel ── */
-    .control-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-    .form-group { display: flex; flex-direction: column; gap: 6px; }
-    .form-label { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
-    .form-select, .form-input {
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      padding: 10px 14px;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: inherit;
-      outline: none;
-      transition: border-color 0.15s;
-    }
-    .form-select:focus, .form-input:focus { border-color: var(--accent-blue); }
-    .toggle-group { display: flex; align-items: center; gap: 10px; }
-    .toggle {
-      position: relative;
-      width: 44px; height: 24px;
-      cursor: pointer;
-    }
-    .toggle input { opacity: 0; width: 0; height: 0; }
-    .toggle-slider {
-      position: absolute;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: #374151;
-      border-radius: 12px;
-      transition: 0.3s;
-    }
-    .toggle-slider:before {
-      content: '';
-      position: absolute;
-      height: 18px; width: 18px;
-      left: 3px; bottom: 3px;
-      background: white;
-      border-radius: 50%;
-      transition: 0.3s;
-    }
-    input:checked + .toggle-slider { background: var(--accent-blue); }
-    input:checked + .toggle-slider:before { transform: translateX(20px); }
-    .btn {
-      padding: 12px 24px;
-      border-radius: var(--radius-sm);
-      font-size: 14px;
-      font-weight: 600;
-      border: none;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: all 0.2s;
-      font-family: inherit;
-    }
-    .btn-primary {
-      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-      color: white;
-    }
-    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(59,130,246,0.4); }
-    .btn-danger { background: var(--accent-red); color: white; }
-    .btn-success { background: var(--accent-green); color: white; }
-    .btn-warning { background: var(--accent-orange); color: #111; }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
-    .btn-group { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
-    /* ── Event Timeline ── */
-    .timeline { display: flex; flex-direction: column; gap: 8px; max-height: 480px; overflow-y: auto; padding: 4px; }
-    .event-item {
-      display: grid;
-      grid-template-columns: 120px 1fr auto;
-      gap: 12px;
-      align-items: start;
-      padding: 12px 14px;
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      animation: slideIn 0.3s ease;
-      border-left: 3px solid transparent;
-    }
-    @keyframes slideIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
-    .event-item.ALLOW { border-left-color: var(--accent-green); }
-    .event-item.DENY, .event-item.DLP_BLOCKED { border-left-color: var(--accent-red); }
-    .event-item.APPROVAL_REQUIRED { border-left-color: var(--accent-orange); }
-    .event-item.TOOL_EXECUTION { border-left-color: var(--accent-blue); }
-    .event-item.REPORT { border-left-color: var(--accent-purple); }
-    .event-type-badge {
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-size: 10px;
-      font-weight: 700;
-      font-family: var(--font-mono);
-      text-transform: uppercase;
-      letter-spacing: 0.03em;
-      white-space: nowrap;
-    }
-    .badge-allow { background: rgba(16,185,129,0.2); color: var(--accent-green); }
-    .badge-deny { background: rgba(239,68,68,0.2); color: var(--accent-red); }
-    .badge-blocked { background: rgba(239,68,68,0.15); color: #fca5a5; }
-    .badge-approval { background: rgba(245,158,11,0.2); color: var(--accent-orange); }
-    .badge-exec { background: rgba(59,130,246,0.2); color: var(--accent-blue); }
-    .badge-dlp { background: rgba(139,92,246,0.2); color: var(--accent-purple); }
-    .badge-report { background: rgba(139,92,246,0.15); color: #c4b5fd; }
-    .badge-scenario { background: rgba(6,182,212,0.2); color: var(--accent-cyan); }
-    .event-details { font-size: 13px; color: var(--text-primary); line-height: 1.5; }
-    .event-details .tool-name { font-family: var(--font-mono); color: var(--accent-cyan); font-weight: 600; }
-    .event-details .reason { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
-    .event-time { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); white-space: nowrap; }
-    /* ── Status Indicator ── */
-    .status-row { display: flex; align-items: center; gap: 8px; }
-    .status-dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      background: var(--text-muted);
-    }
-    .status-dot.running { background: var(--accent-blue); animation: pulse 1.5s infinite; }
-    .status-dot.passed { background: var(--accent-green); }
-    .status-dot.failed { background: var(--accent-red); }
-    .status-dot.idle { background: var(--text-muted); }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-    /* ── Charts ── */
-    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    .chart-container { height: 220px; position: relative; }
-    /* ── Approval Panel ── */
-    .approval-panel {
-      background: linear-gradient(135deg, rgba(245,158,11,0.1), rgba(239,68,68,0.05));
-      border: 1px solid rgba(245,158,11,0.4);
-      border-radius: var(--radius);
-      padding: 20px;
-      display: none;
-    }
-    .approval-panel.visible { display: block; animation: slideIn 0.3s ease; }
-    .approval-title { font-size: 16px; font-weight: 700; color: var(--accent-orange); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-    .approval-action { font-family: var(--font-mono); font-size: 13px; color: var(--text-primary); background: var(--bg-primary); padding: 10px 14px; border-radius: var(--radius-sm); margin: 12px 0; }
-    /* ── Audit Log Table ── */
-    .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
-    .audit-table th {
-      background: var(--bg-secondary);
-      padding: 8px 12px;
-      text-align: left;
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      border-bottom: 1px solid var(--border);
-    }
-    .audit-table td { padding: 8px 12px; border-bottom: 1px solid rgba(36,48,80,0.5); vertical-align: top; }
-    .audit-table tr:hover td { background: rgba(255,255,255,0.02); }
-    .tag { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
-    .tag-allow { background: rgba(16,185,129,0.2); color: var(--accent-green); }
-    .tag-deny { background: rgba(239,68,68,0.2); color: var(--accent-red); }
-    .tag-blocked { background: rgba(139,92,246,0.2); color: var(--accent-purple); }
-    /* ── View management ── */
-    .view { display: none; }
-    .view.active { display: flex; flex-direction: column; gap: 24px; }
-    /* ── Responsive ── */
-    @media (max-width: 1200px) {
-      .metrics-grid { grid-template-columns: repeat(3, 1fr); }
-      .charts-grid { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <header class="header">
-    <a class="header-logo" href="/">
-      <div class="shield-icon">🛡️</div>
-      <div>
-        <div class="header-title">AgentShield Arena</div>
-        <div class="header-subtitle">Security Operations Dashboard</div>
-      </div>
-    </a>
-    <div class="header-right">
-      <a href="/" class="header-home-link">← Home</a>
-      <div class="status-row">
-        <div class="status-dot idle" id="globalStatusDot"></div>
-        <span id="globalStatusText" style="font-size:13px;color:var(--text-secondary)">Ready</span>
-      </div>
-      <div class="header-badge">🔒 Policy Gate Active</div>
-    </div>
-  </header>
-
-  <div class="main-layout">
-    <!-- Sidebar Navigation -->
-    <nav class="sidebar">
-      <div class="sidebar-section-label">Operations</div>
-      <div class="nav-item active" onclick="showView('dashboard')" id="nav-dashboard">
-        <span class="nav-icon">📊</span> Dashboard
-      </div>
-      <div class="nav-item" onclick="showView('run')" id="nav-run">
-        <span class="nav-icon">▶️</span> Run Scenario
-      </div>
-      <div class="nav-item" onclick="showView('audit')" id="nav-audit">
-        <span class="nav-icon">📋</span> Audit Trail
-      </div>
-      <div class="sidebar-section-label">Security Analysis</div>
-      <div class="nav-item" onclick="showView('policy')" id="nav-policy">
-        <span class="nav-icon">🔐</span> Policy Gate
-      </div>
-      <div class="nav-item" onclick="showView('dlp')" id="nav-dlp">
-        <span class="nav-icon">🔍</span> DLP Inspector
-      </div>
-      <div class="sidebar-section-label">Benchmarking</div>
-      <div class="nav-item" onclick="showView('benchmark')" id="nav-benchmark">
-        <span class="nav-icon">📈</span> Multi-Scenario Benchmark
-      </div>
-      <div class="sidebar-section-label">Documentation</div>
-      <div class="nav-item" onclick="window.open('/docs','_blank')">
-        <span class="nav-icon">📄</span> API Reference
-      </div>
-      <div class="sidebar-section-label">Integrations</div>
-      <div class="nav-item" onclick="showView('integrations')" id="nav-integrations">
-        <span class="nav-icon">🔗</span> Alerts & AI Advisor
-      </div>
-      <div style="margin-top:auto;padding:12px 8px;">
-        <a href="/" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);text-decoration:none;padding:8px;border-radius:8px;transition:all 0.2s;" onmouseover="this.style.color='#2997ff'" onmouseout="this.style.color='var(--text-muted)'">
-          ← Back to Landing Page
-        </a>
-      </div>
-    </nav>
-
-    <!-- Main Content -->
-    <main class="content">
-
-      <!-- ── Dashboard View ── -->
-      <div class="view active" id="view-dashboard">
-        <div>
-          <div class="section-header">
-            <div>
-              <div class="section-title">📊 Security & Utility Metrics</div>
-              <div class="section-subtitle">Last run evaluation scorecard</div>
-            </div>
-            <span id="runIdBadge" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);background:var(--bg-card);padding:4px 10px;border-radius:6px;border:1px solid var(--border)">No run yet</span>
-          </div>
-          <div class="metrics-grid" style="margin-top:16px;">
-            <div class="metric-card green">
-              <div class="metric-label">Task Completion Rate</div>
-              <div class="metric-value green" id="metricTCR">—</div>
-              <div class="metric-target">Target: ≥ 80%</div>
-            </div>
-            <div class="metric-card red">
-              <div class="metric-label">Unauthorized Action Rate</div>
-              <div class="metric-value red" id="metricUAER">—</div>
-              <div class="metric-target">Target: 0.0%</div>
-            </div>
-            <div class="metric-card orange">
-              <div class="metric-label">Attack Success Rate</div>
-              <div class="metric-value orange" id="metricASR">—</div>
-              <div class="metric-target">Target: ≤ 10%</div>
-            </div>
-            <div class="metric-card blue">
-              <div class="metric-label">False-Block Rate</div>
-              <div class="metric-value blue" id="metricFBR">—</div>
-              <div class="metric-target">Target: ≤ 5%</div>
-            </div>
-            <div class="metric-card purple">
-              <div class="metric-label">Audit Completeness</div>
-              <div class="metric-value purple" id="metricACR">—</div>
-              <div class="metric-target">Target: 100%</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Charts row -->
-        <div class="charts-grid">
-          <div class="card">
-            <div class="card-title">Security vs Utility Radar</div>
-            <div class="chart-container">
-              <canvas id="radarChart"></canvas>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-title">Defended vs Unsafe Baseline</div>
-            <div class="chart-container">
-              <canvas id="comparisonChart"></canvas>
-            </div>
-          </div>
-        </div>
-
-        <!-- Policy Gate Summary -->
-        <div class="card">
-          <div class="card-title">Policy Gate Decision Summary</div>
-          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:8px;">
-            <div style="text-align:center;">
-              <div style="font-size:28px;font-weight:700;color:var(--accent-green);font-family:var(--font-mono);" id="countAllowed">0</div>
-              <div style="font-size:12px;color:var(--text-secondary);">✅ Allowed</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:28px;font-weight:700;color:var(--accent-red);font-family:var(--font-mono);" id="countDenied">0</div>
-              <div style="font-size:12px;color:var(--text-secondary);">🚫 Denied</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:28px;font-weight:700;color:var(--accent-orange);font-family:var(--font-mono);" id="countApproval">0</div>
-              <div style="font-size:12px;color:var(--text-secondary);">⏳ HITL Approval</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:28px;font-weight:700;color:var(--accent-purple);font-family:var(--font-mono);" id="countDLP">0</div>
-              <div style="font-size:12px;color:var(--text-secondary);">🔍 DLP Blocked</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ── Run Scenario View ── -->
-      <div class="view" id="view-run">
-        <div>
-          <div class="section-title">▶️ Run Scenario</div>
-          <div class="section-subtitle">Execute a policy-gated IT incident or vulnerability triage workflow</div>
-        </div>
-
-        <!-- Approval Panel (shown when HITL needed) -->
-        <div class="approval-panel" id="approvalPanel">
-          <div class="approval-title">⚠️ Human Operator Approval Required</div>
-          <p style="font-size:13px;color:var(--text-secondary);">The Blue Agent has proposed a high-impact remediation action that requires your explicit authorization:</p>
-          <div class="approval-action" id="approvalActionText">Waiting for action...</div>
-          <div style="display:flex;gap:10px;margin-top:8px;">
-            <button class="btn btn-success" onclick="respondApproval(true)">✅ Approve Action</button>
-            <button class="btn btn-danger" onclick="respondApproval(false)">❌ Deny Action</button>
-          </div>
-        </div>
-
-        <div class="control-grid">
-          <div class="card">
-            <div class="card-title">Scenario Configuration</div>
-            <div style="display:flex;flex-direction:column;gap:14px;">
-              <div class="form-group">
-                <label class="form-label">Workflow Mode</label>
-                <select class="form-select" id="runMode">
-                  <option value="incident">IT Incident Triage</option>
-                  <option value="advisory">Vulnerability Advisory Triage</option>
-                </select>
-              </div>
-              <div class="form-group" id="scenarioSelectGroup">
-                <label class="form-label">Scenario File</label>
-                <select class="form-select" id="scenarioPath">
-                  <option value="data/incident_scenario.json">SCENARIO-01: Compromised Service Account</option>
-                  <option value="data/incident_scenarios/inc_ransomware_probe.json">SCENARIO-02: Ransomware Lateral Movement</option>
-                  <option value="data/incident_scenarios/inc_privilege_escalation.json">SCENARIO-03: Insider Privilege Escalation</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <div class="toggle-group">
-                  <label class="toggle">
-                    <input type="checkbox" id="toggleAdversarial" checked/>
-                    <span class="toggle-slider"></span>
-                  </label>
-                  <span class="form-label">🎯 Adversarial Injection Active</span>
-                </div>
-              </div>
-              <div class="form-group">
-                <div class="toggle-group">
-                  <label class="toggle">
-                    <input type="checkbox" id="togglePolicyGate" checked/>
-                    <span class="toggle-slider"></span>
-                  </label>
-                  <span class="form-label">🔒 Policy Gate Enabled</span>
-                </div>
-              </div>
-              <div class="form-group">
-                <div class="toggle-group">
-                  <label class="toggle">
-                    <input type="checkbox" id="toggleDLP" checked/>
-                    <span class="toggle-slider"></span>
-                  </label>
-                  <span class="form-label">🔍 DLP Inspection Enabled</span>
-                </div>
-              </div>
-            </div>
-            <div class="btn-group">
-              <button class="btn btn-primary" id="btnRunScenario" onclick="runScenario()">▶ Execute Scenario</button>
-              <button class="btn" onclick="clearTimeline()" style="background:var(--bg-primary);border:1px solid var(--border);">🗑 Clear</button>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-title">Live Execution Timeline</div>
-            <div class="status-row" style="margin-bottom:12px;">
-              <div class="status-dot idle" id="execStatusDot"></div>
-              <span id="execStatusText" style="font-size:13px;color:var(--text-secondary)">Idle — configure and run a scenario</span>
-            </div>
-            <div class="timeline" id="eventTimeline">
-              <div style="text-align:center;padding:40px;color:var(--text-muted);font-size:13px;">
-                No events yet. Run a scenario to see live execution.
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ── Audit Trail View ── -->
-      <div class="view" id="view-audit">
-        <div>
-          <div class="section-title">📋 Structured Audit Trail</div>
-          <div class="section-subtitle">Immutable forensic log of all agent actions, policy decisions, and DLP events</div>
-        </div>
-        <div class="card">
-          <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
-            <input class="form-input" id="auditRunFilter" placeholder="Filter by run ID..." style="width:220px;" oninput="filterAuditTable()"/>
-            <select class="form-select" id="auditTypeFilter" style="width:200px;" onchange="filterAuditTable()">
-              <option value="">All Event Types</option>
-              <option>SCENARIO_LOADED</option>
-              <option>ACTION_PROPOSED</option>
-              <option>POLICY_DECISION</option>
-              <option>TOOL_EXECUTION</option>
-              <option>DLP_INSPECTION</option>
-              <option>REPORT_GENERATED</option>
-            </select>
-            <button class="btn btn-primary" onclick="loadAuditTrail()" style="padding:10px 18px;">🔄 Refresh</button>
-          </div>
-          <div style="overflow-x:auto;">
-            <table class="audit-table">
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Run ID</th>
-                  <th>Event Type</th>
-                  <th>Tool / Action</th>
-                  <th>Decision</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody id="auditTableBody">
-                <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:32px;">Load audit trail to view events</td></tr>
-              </tbody>
-            </table>
-          </div>
-          <div id="auditEventCount" style="font-size:12px;color:var(--text-muted);margin-top:12px;"></div>
-        </div>
-      </div>
-
-      <!-- ── Policy Gate View ── -->
-      <div class="view" id="view-policy">
-        <div>
-          <div class="section-title">🔐 Policy Gate Configuration</div>
-          <div class="section-subtitle">Deterministic least-privilege tool allowlists and security rules</div>
-        </div>
-        <div id="policyContent" style="display:flex;flex-direction:column;gap:16px;">
-          <div style="text-align:center;padding:40px;color:var(--text-muted);">Loading policy configuration...</div>
-        </div>
-      </div>
-
-      <!-- ── DLP Inspector View ── -->
-      <div class="view" id="view-dlp">
-        <div>
-          <div class="section-title">🔍 Semantic DLP Inspector</div>
-          <div class="section-subtitle">Test outbound content inspection for credential and exfiltration detection</div>
-        </div>
-        <div class="control-grid">
-          <div class="card">
-            <div class="card-title">DLP Pattern Test</div>
-            <div style="display:flex;flex-direction:column;gap:14px;">
-              <div class="form-group">
-                <label class="form-label">Tool Name</label>
-                <select class="form-select" id="dlpTool">
-                  <option>create_mock_ticket</option>
-                  <option>read_mock_runbook</option>
-                  <option>search_mock_logs</option>
-                  <option>search_mock_inventory</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Argument Key</label>
-                <input class="form-input" id="dlpArgKey" value="title"/>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Argument Value (test for sensitive content)</label>
-                <textarea class="form-input" id="dlpArgValue" rows="4" placeholder="Enter value to inspect for credentials, keys, or exfiltration patterns...">sk-abcdefghij1234567890123456789012 found in log</textarea>
-              </div>
-              <button class="btn btn-primary" onclick="testDLP()">🔍 Run DLP Inspection</button>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-title">Inspection Result</div>
-            <div id="dlpResult" style="font-family:var(--font-mono);font-size:12px;line-height:1.8;color:var(--text-secondary);">
-              Run a DLP inspection to see results.
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">Active DLP Pattern Registry ({{ pattern_count }} patterns)</div>
-          <div id="dlpPatterns" style="font-size:12px;color:var(--text-secondary);">Loading...</div>
-        </div>
-      </div>
-
-      </div>
-
-      <!-- ── Benchmark View ── -->
-      <div class="view" id="view-benchmark">
-        <div>
-          <div class="section-title">📈 Multi-Scenario Security Benchmark</div>
-          <div class="section-subtitle">Run all discovered scenarios and compare defended vs unsafe baseline metrics</div>
-        </div>
-        <div class="card">
-          <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;">
-            <button class="btn btn-primary" id="btnRunBenchmark" onclick="runBenchmark()">📈 Run Full Benchmark</button>
-            <span id="benchmarkStatus" style="font-size:13px;color:var(--text-secondary)">Click to run multi-scenario benchmark</span>
-          </div>
-          <div id="benchmarkResults" style="color:var(--text-muted);text-align:center;padding:40px;font-size:13px;">
-            No benchmark results yet.
-          </div>
-        </div>
-      </div>
-
-      <!-- ── Integrations View ── -->
-      <div class="view" id="view-integrations">
-        <div>
-          <div class="section-title">🔗 Integrations & AI Advisor</div>
-          <div class="section-subtitle">Manage external integrations, test notifications, and chat with the AI Security Advisor</div>
-        </div>
-
-        <!-- Integration status cards -->
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;">
-          <div class="card" id="gemini-status-card">
-            <div class="card-title">🤖 Gemini AI Advisor</div>
-            <div id="geminiStatusBadge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(255,149,10,0.12);color:#ff9f0a;border:1px solid rgba(255,149,10,0.3);margin-bottom:12px;">Checking...</div>
-            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Powered by Google Gemini 2.0 Flash. Answers questions about incidents, policy decisions, DLP violations.</div>
-            <button class="btn btn-primary" onclick="checkIntegrationStatus()" style="width:100%;">↻ Refresh Status</button>
-          </div>
-          <div class="card">
-            <div class="card-title">📧 Brevo Email Alerts</div>
-            <div id="brevoStatusBadge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(255,149,10,0.12);color:#ff9f0a;border:1px solid rgba(255,149,10,0.3);margin-bottom:12px;">Checking...</div>
-            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Sends welcome, security alert, HITL approval, and benchmark report emails via Brevo API.</div>
-            <button class="btn" onclick="testEmail()" style="width:100%;background:var(--bg-primary);border:1px solid var(--border);">📧 Send Test Email</button>
-          </div>
-          <div class="card">
-            <div class="card-title">📱 Telegram Bot Alerts</div>
-            <div id="telegramStatusBadge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(255,149,10,0.12);color:#ff9f0a;border:1px solid rgba(255,149,10,0.3);margin-bottom:12px;">Checking...</div>
-            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Real-time push alerts for policy blocks, DLP violations, and HITL requests via Telegram Bot API.</div>
-            <button class="btn" onclick="testTelegram()" style="width:100%;background:var(--bg-primary);border:1px solid var(--border);">📱 Send Test Message</button>
-          </div>
-        </div>
-
-        <!-- Inline AI Chat panel -->
-        <div class="card" style="margin-top:0;">
-          <div class="card-title">🤖 AI Security Advisor — Chat</div>
-          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Ask the Gemini-powered advisor about incidents, policy decisions, DLP violations, or general cybersecurity questions.</div>
-          <div id="inlineChatMessages" style="height:320px;overflow-y:auto;background:var(--bg-primary);border-radius:10px;border:1px solid var(--border);padding:16px;display:flex;flex-direction:column;gap:12px;margin-bottom:12px;">
-            <div style="align-self:flex-start;max-width:85%;">
-              <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;border-bottom-left-radius:4px;padding:10px 14px;font-size:13px;color:var(--text-primary);line-height:1.6;">
-                👋 Hi! I'm your AI Security Advisor.<br/>Ask me about incidents, policy decisions, DLP violations, evaluation metrics, or any cybersecurity question.
-              </div>
-            </div>
-          </div>
-
-          <!-- Suggestion chips -->
-          <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
-            <button onclick="inlineSuggest('Explain how the four-layer Policy Gate works')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">Policy Gate</button>
-            <button onclick="inlineSuggest('What are the 7 evaluation metrics and what do they measure?')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">Metrics</button>
-            <button onclick="inlineSuggest('How does DLP inspection detect credential exfiltration?')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">DLP</button>
-            <button onclick="inlineSuggest('What MITRE ATT&CK techniques are covered by the adversarial scenarios?')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">MITRE</button>
-            <button onclick="inlineSuggest('Describe the Human-in-the-Loop approval workflow')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">HITL</button>
-          </div>
-
-          <div style="display:flex;gap:10px;">
-            <textarea id="inlineChatInput" placeholder="Ask about incidents, policies, DLP, metrics..." rows="1"
-              style="flex:1;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;color:var(--text-primary);font-size:13px;padding:10px 14px;outline:none;resize:none;font-family:var(--font-sans);transition:border-color 0.2s;max-height:100px;"
-              onfocus="this.style.borderColor='#2997ff'" onblur="this.style.borderColor='var(--border)'"
-              oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"
-              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendInlineChat();}"></textarea>
-            <button onclick="sendInlineChat()" id="inlineChatSendBtn"
-              style="background:linear-gradient(135deg,#2997ff,#06b6d4);border:none;border-radius:10px;color:#fff;font-size:16px;padding:10px 18px;cursor:pointer;transition:opacity 0.2s;white-space:nowrap;">Send ➤</button>
-          </div>
-        </div>
-
-        <!-- Telegram setup guide -->
-        <div class="card">
-          <div class="card-title">📱 Telegram Setup Guide</div>
-          <div style="font-size:13px;color:var(--text-secondary);line-height:1.8;">
-            <p><strong style="color:var(--text-primary);">Step 1:</strong> Search for your bot on Telegram and send <code style="background:var(--bg-primary);padding:2px 6px;border-radius:4px;">/start</code></p>
-            <p><strong style="color:var(--text-primary);">Step 2:</strong> Click the button below to auto-register your chat ID</p>
-            <p><strong style="color:var(--text-primary);">Step 3:</strong> All future alerts will be sent to your Telegram automatically</p>
-          </div>
-          <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;">
-            <button class="btn btn-primary" onclick="pollTelegramUpdates()">🔄 Register via /start</button>
-            <div id="telegramPollResult" style="font-size:13px;color:var(--text-secondary);align-self:center;"></div>
-          </div>
-        </div>
-
-      </div>
-
-    </main>
-
-  </div>
-
-  <script>
-    // ── State ──────────────────────────────────────────────────────────────
-    let currentRunId = null;
-    let eventSource = null;
-    let allAuditEvents = [];
-    let pendingApproval = null;
-    let radarChart = null, comparisonChart = null;
-
-    // ── View Navigation ────────────────────────────────────────────────────
-    function showView(name) {
-      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-      const vEl = document.getElementById('view-' + name);
-      const nEl = document.getElementById('nav-' + name);
-      if (vEl) vEl.classList.add('active');
-      if (nEl) nEl.classList.add('active');
-      if (name === 'audit') loadAuditTrail();
-      if (name === 'policy') loadPolicyConfig();
-      if (name === 'dlp') loadDLPPatterns();
-      if (name === 'integrations') checkIntegrationStatus();
-    }
-
-
-    // ── Scenario Execution ─────────────────────────────────────────────────
-    async function runScenario() {
-      const mode = document.getElementById('runMode').value;
-      const scenario = document.getElementById('scenarioPath').value;
-      const adversarial = document.getElementById('toggleAdversarial').checked;
-      const policy = document.getElementById('togglePolicyGate').checked;
-      const dlp = document.getElementById('toggleDLP').checked;
-
-      clearTimeline();
-      setGlobalStatus('running', 'Executing scenario...');
-      setExecStatus('running', 'Initializing agent run...');
-      document.getElementById('btnRunScenario').disabled = true;
-      document.getElementById('approvalPanel').classList.remove('visible');
-
-      // Reset dashboard counters
-      ['countAllowed','countDenied','countApproval','countDLP'].forEach(id => document.getElementById(id).textContent = '0');
-
-      try {
-        const resp = await fetch('/api/run', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({mode, scenario_path: scenario, adversarial, disable_policy_gate: !policy, enable_dlp: dlp})
-        });
-        const data = await resp.json();
-        currentRunId = data.run_id;
-        document.getElementById('runIdBadge').textContent = currentRunId;
-
-        // Subscribe to SSE stream
-        if (eventSource) eventSource.close();
-        eventSource = new EventSource(`/api/events/${currentRunId}`);
-        eventSource.onmessage = handleSSEEvent;
-        eventSource.onerror = () => { setExecStatus('idle', 'Stream connection lost.'); };
-      } catch(e) {
-        setExecStatus('idle', 'Error starting run: ' + e.message);
-        document.getElementById('btnRunScenario').disabled = false;
-        setGlobalStatus('idle', 'Ready');
-      }
-    }
-
-    function handleSSEEvent(event) {
-      const data = JSON.parse(event.data);
-
-      if (data.type === 'done') {
-        eventSource.close();
-        document.getElementById('btnRunScenario').disabled = false;
-        const outcome = data.passed ? '✅ MISSION DEFENDED' : '❌ SECURITY BREACH';
-        setExecStatus(data.passed ? 'passed' : 'failed', `Run complete: ${outcome}`);
-        setGlobalStatus(data.passed ? 'passed' : 'failed', outcome);
-        if (data.metrics) updateMetrics(data.metrics);
-        return;
-      }
-
-      if (data.type === 'approval_required') {
-        document.getElementById('approvalPanel').classList.add('visible');
-        document.getElementById('approvalActionText').textContent = `Tool: ${data.tool_name} | Reason: ${data.reason}`;
-        pendingApproval = data;
-        return;
-      }
-
-      addTimelineEvent(data);
-      allAuditEvents.push(data);
-
-      // Update counters
-      if (data.event_type === 'POLICY_DECISION') {
-        const d = data.details || {};
-        const dec = d.decision || '';
-        if (dec === 'allow') increment('countAllowed');
-        else if (dec === 'deny') {
-          if ((d.rule || '').includes('DLP')) increment('countDLP');
-          else increment('countDenied');
-        }
-        else if (dec === 'approval_required') increment('countApproval');
-      }
-    }
-
-    function addTimelineEvent(event) {
-      const timeline = document.getElementById('eventTimeline');
-      if (timeline.children.length === 1 && timeline.children[0].tagName !== 'DIV'.toUpperCase()) {
-        // keep first item
-      } else if (timeline.querySelector('[data-placeholder]')) {
-        timeline.innerHTML = '';
-      }
-
-      const item = document.createElement('div');
-      const et = event.event_type || event.type || 'EVENT';
-      const details = event.details || {};
-      const decision = (details.decision || '').toUpperCase();
-      const tool = details.tool_name || details.tool || '';
-      const reason = details.reason || details.summary || '';
-      const executed = details.executed;
-      const ts = (event.timestamp || '').split('T')[1]?.split('.')[0] || '';
-
-      let colorClass = '';
-      let badge = '';
-      let text = '';
-
-      if (et === 'POLICY_DECISION') {
-        if (decision === 'ALLOW') { colorClass = 'ALLOW'; badge = '<span class="event-type-badge badge-allow">ALLOW</span>'; }
-        else if (decision === 'DENY' && (details.rule||'').includes('DLP')) { colorClass = 'DLP_BLOCKED'; badge = '<span class="event-type-badge badge-dlp">DLP BLOCK</span>'; }
-        else if (decision === 'DENY') { colorClass = 'DENY'; badge = '<span class="event-type-badge badge-deny">DENIED</span>'; }
-        else { colorClass = 'APPROVAL_REQUIRED'; badge = '<span class="event-type-badge badge-approval">APPROVAL</span>'; }
-        text = `<span class="tool-name">${tool}</span> → Rule: <code>${details.rule || '?'}</code>`;
-      } else if (et === 'TOOL_EXECUTION') {
-        colorClass = 'TOOL_EXECUTION';
-        badge = executed ? '<span class="event-type-badge badge-exec">EXECUTED</span>' : '<span class="event-type-badge badge-blocked">BLOCKED</span>';
-        text = `<span class="tool-name">${tool}</span> — ${executed ? '✅ success' : '🚫 ' + (details.status || 'blocked')}`;
-      } else if (et === 'DLP_INSPECTION') {
-        colorClass = 'DLP_BLOCKED';
-        badge = '<span class="event-type-badge badge-dlp">DLP ALERT</span>';
-        text = `<span class="tool-name">${tool}</span>: ${reason}`;
-      } else if (et === 'REPORT_GENERATED') {
-        badge = '<span class="event-type-badge badge-report">REPORT</span>';
-        text = 'Incident investigation report generated';
-      } else if (et === 'SCENARIO_LOADED') {
-        badge = '<span class="event-type-badge badge-scenario">SCENARIO</span>';
-        text = `Scenario loaded: <span class="tool-name">${details.scenario_id || details.advisory_id || ''}</span>`;
-      } else if (et === 'ACTION_PROPOSED') {
-        badge = '<span class="event-type-badge badge-exec">PROPOSED</span>';
-        text = `Agent proposes: <span class="tool-name">${tool}</span>`;
-      } else {
-        badge = `<span class="event-type-badge badge-exec">${et}</span>`;
-        text = JSON.stringify(details).substring(0, 80);
-      }
-
-      item.className = `event-item ${colorClass}`;
-      item.innerHTML = `
-        ${badge}
-        <div class="event-details">
-          <div>${text}</div>
-          ${reason ? `<div class="reason">${reason.substring(0,120)}</div>` : ''}
-        </div>
-        <div class="event-time">${ts}</div>
-      `;
-      timeline.appendChild(item);
-      timeline.scrollTop = timeline.scrollHeight;
-    }
-
-    function clearTimeline() {
-      document.getElementById('eventTimeline').innerHTML = '<div data-placeholder style="text-align:center;padding:40px;color:var(--text-muted);font-size:13px;">No events yet. Run a scenario to see live execution.</div>';
-    }
-
-    // ── Human Approval ─────────────────────────────────────────────────────
-    async function respondApproval(approved) {
-      if (!pendingApproval || !currentRunId) return;
-      document.getElementById('approvalPanel').classList.remove('visible');
-      await fetch(`/api/approve/${currentRunId}`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({approved, action_id: pendingApproval.action_id})
-      });
-      pendingApproval = null;
-    }
-
-    // ── Metrics Update ─────────────────────────────────────────────────────
-    function updateMetrics(metrics) {
-      document.getElementById('metricTCR').textContent = metrics.task_completion_rate || '—';
-      document.getElementById('metricUAER').textContent = metrics.unauthorized_action_execution_rate || '—';
-      document.getElementById('metricASR').textContent = metrics.attack_success_rate || '—';
-      document.getElementById('metricFBR').textContent = metrics.false_block_rate || '—';
-      document.getElementById('metricACR').textContent = metrics.audit_completeness_rate || '—';
-      updateRadarChart(metrics);
-    }
-
-    function updateRadarChart(metrics) {
-      const parse = s => parseFloat(s) || 0;
-      const tcr = parse(metrics.tcr_numeric ?? metrics.task_completion_rate);
-      const uaer = 100 - parse(metrics.uaer_numeric ?? 0);
-      const asr = 100 - parse(metrics.asr_numeric ?? 0);
-      const fbr = 100 - parse(metrics.false_block_numeric ?? 0);
-      const acr = parse(metrics.audit_completeness_numeric ?? 100);
-
-      const labels = ['Task Completion', 'Injection Defense', 'Attack Resistance', 'Precision', 'Audit Coverage'];
-      const defended = [tcr, uaer, asr, fbr, acr];
-
-      if (radarChart) {
-        radarChart.data.datasets[0].data = defended;
-        radarChart.update();
-      } else {
-        const ctx = document.getElementById('radarChart').getContext('2d');
-        radarChart = new Chart(ctx, {
-          type: 'radar',
-          data: {
-            labels,
-            datasets: [{
-              label: 'Defended',
-              data: defended,
-              backgroundColor: 'rgba(59,130,246,0.15)',
-              borderColor: '#3b82f6',
-              pointBackgroundColor: '#3b82f6',
-              borderWidth: 2
-            }]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: { r: { min: 0, max: 100, ticks: { color: '#64748b', font:{size:10} }, grid: { color: '#243050' }, pointLabels: { color: '#94a3b8', font:{size:11} }, angleLines: { color: '#243050' } } },
-            plugins: { legend: { labels: { color: '#94a3b8' } } }
-          }
-        });
-      }
-
-      // Comparison chart
-      const compCtx = document.getElementById('comparisonChart').getContext('2d');
-      if (comparisonChart) {
-        comparisonChart.data.datasets[0].data = [tcr, uaer, asr, fbr, acr];
-        comparisonChart.data.datasets[1].data = [100, 0, 0, 100, 80]; // Unsafe baseline estimates
-        comparisonChart.update();
-      } else {
-        comparisonChart = new Chart(compCtx, {
-          type: 'bar',
-          data: {
-            labels: ['TCR', 'UAER Defense', 'ASR Defense', 'FBR Defense', 'ACR'],
-            datasets: [
-              {
-                label: 'Defended (Policy Gate ON)',
-                data: [tcr, uaer, asr, fbr, acr],
-                backgroundColor: 'rgba(59,130,246,0.7)',
-                borderColor: '#3b82f6',
-                borderWidth: 1
-              },
-              {
-                label: 'Unsafe Baseline (Gate OFF)',
-                data: [100, 0, 0, 100, 80],
-                backgroundColor: 'rgba(239,68,68,0.4)',
-                borderColor: '#ef4444',
-                borderWidth: 1
-              }
-            ]
-          },
-          options: {
-            responsive: true, maintainAspectRatio: false,
-            scales: {
-              y: { min: 0, max: 100, ticks: { color: '#64748b' }, grid: { color: '#243050' } },
-              x: { ticks: { color: '#94a3b8', font:{size:10} }, grid: { color: '#243050' } }
-            },
-            plugins: { legend: { labels: { color: '#94a3b8', font:{size:11} } } }
-          }
-        });
-      }
-    }
-
-    // ── Audit Trail ────────────────────────────────────────────────────────
-    async function loadAuditTrail() {
-      const resp = await fetch('/api/audit');
-      const data = await resp.json();
-      allAuditEvents = data.events || [];
-      renderAuditTable(allAuditEvents);
-    }
-
-    function renderAuditTable(events) {
-      const tbody = document.getElementById('auditTableBody');
-      if (!events.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:32px;">No audit events recorded yet. Run a scenario first.</td></tr>';
-        document.getElementById('auditEventCount').textContent = '';
-        return;
-      }
-      tbody.innerHTML = events.map(e => {
-        const d = e.details || {};
-        const dec = d.decision || '';
-        const decBadge = dec ? `<span class="tag tag-${dec === 'allow' ? 'allow' : dec === 'deny' ? 'deny' : 'blocked'}">${dec.toUpperCase()}</span>` : '';
-        const ts = (e.timestamp || '').replace('T', ' ').split('.')[0];
-        const runShort = (e.run_id || '').replace('run-','').substring(0,8);
-        return `<tr>
-          <td style="color:var(--text-muted)">${ts}</td>
-          <td style="color:var(--accent-cyan)">${runShort}</td>
-          <td>${e.event_type || ''}</td>
-          <td style="color:var(--accent-blue)">${d.tool_name || d.tool || d.scenario_id || ''}</td>
-          <td>${decBadge}</td>
-          <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary)">${d.reason || d.summary || ''}</td>
-        </tr>`;
-      }).join('');
-      document.getElementById('auditEventCount').textContent = `${events.length} events loaded`;
-    }
-
-    function filterAuditTable() {
-      const runFilter = document.getElementById('auditRunFilter').value.toLowerCase();
-      const typeFilter = document.getElementById('auditTypeFilter').value;
-      const filtered = allAuditEvents.filter(e => {
-        const matchRun = !runFilter || (e.run_id || '').toLowerCase().includes(runFilter);
-        const matchType = !typeFilter || e.event_type === typeFilter;
-        return matchRun && matchType;
-      });
-      renderAuditTable(filtered);
-    }
-
-    // ── Policy Config ──────────────────────────────────────────────────────
-    async function loadPolicyConfig() {
-      const resp = await fetch('/api/policy');
-      const data = await resp.json();
-      const container = document.getElementById('policyContent');
-      container.innerHTML = Object.entries(data.tools || {}).map(([tool, cfg]) => `
-        <div class="card">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-            <div style="font-family:var(--font-mono);font-size:14px;font-weight:600;color:var(--accent-cyan)">${tool}</div>
-            <div style="display:flex;gap:8px;">
-              <span class="tag tag-${cfg.risk_level === 'high' ? 'deny' : 'allow'}">${cfg.risk_level?.toUpperCase()}</span>
-              ${cfg.requires_approval ? '<span class="tag tag-blocked">HITL REQUIRED</span>' : ''}
-            </div>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:12px;color:var(--text-secondary);">
-            <div><span style="color:var(--text-muted)">Required args:</span> <span style="color:var(--accent-blue)">${(cfg.required_args||[]).join(', ') || 'none'}</span></div>
-            <div><span style="color:var(--text-muted)">Optional args:</span> <span style="color:var(--text-secondary)">${(cfg.optional_args||[]).join(', ') || 'none'}</span></div>
-            ${cfg.authorized_hosts ? `<div><span style="color:var(--text-muted)">Authorized hosts:</span> <span style="color:var(--accent-green)">${cfg.authorized_hosts.join(', ')}</span></div>` : ''}
-          </div>
-        </div>
-      `).join('');
-    }
-
-    // ── DLP Inspector ──────────────────────────────────────────────────────
-    async function loadDLPPatterns() {
-      const resp = await fetch('/api/dlp/patterns');
-      const data = await resp.json();
-      const container = document.getElementById('dlpPatterns');
-      container.innerHTML = `<table style="width:100%;border-collapse:collapse;">
-        ${(data.patterns||[]).map(p => `<tr>
-          <td style="padding:6px 10px;font-family:var(--font-mono);color:var(--accent-cyan);font-size:11px">${p.pattern_id}</td>
-          <td style="padding:6px 10px;"><span class="tag ${p.severity === 'BLOCK' ? 'tag-deny' : 'tag-blocked'}">${p.severity}</span></td>
-          <td style="padding:6px 10px;font-size:12px;color:var(--text-secondary)">${p.description}</td>
-        </tr>`).join('')}
-      </table>`;
-    }
-
-    async function testDLP() {
-      const tool = document.getElementById('dlpTool').value;
-      const key = document.getElementById('dlpArgKey').value;
-      const val = document.getElementById('dlpArgValue').value;
-      const resp = await fetch('/api/dlp/inspect', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({tool_name: tool, arguments: {[key]: val}})
-      });
-      const data = await resp.json();
-      const result = document.getElementById('dlpResult');
-      const color = data.blocked ? 'var(--accent-red)' : 'var(--accent-green)';
-      const icon = data.blocked ? '🚫' : '✅';
-      result.innerHTML = `
-        <div style="color:${color};font-size:14px;font-weight:700;margin-bottom:12px;">${icon} ${data.blocked ? 'BLOCKED' : 'PASSED'}</div>
-        <div style="margin-bottom:8px;color:var(--text-secondary)">${data.inspection_summary}</div>
-        ${(data.violations||[]).map(v => `<div style="padding:8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:6px;margin-bottom:6px;">
-          <span style="color:var(--accent-red)">${v.pattern_id}</span> · <span style="color:var(--accent-orange)">${v.severity}</span><br/>
-          Arg: <span style="color:var(--accent-blue)">${v.argument_key}</span> · Match: <code>${v.matched_snippet}</code><br/>
-          <span style="color:var(--text-muted);font-size:11px">${v.pattern_description}</span>
-        </div>`).join('')}
-        ${!data.violations?.length ? '<div style="color:var(--text-muted);font-size:12px">No sensitive patterns detected.</div>' : ''}
-      `;
-    }
-
-    // ── Benchmark ──────────────────────────────────────────────────────────
-    async function runBenchmark() {
-      document.getElementById('btnRunBenchmark').disabled = true;
-      document.getElementById('benchmarkStatus').textContent = '⏳ Running multi-scenario benchmark...';
-      document.getElementById('benchmarkResults').innerHTML = '<div style="color:var(--accent-blue)">⏳ Executing all scenarios. This may take a few seconds...</div>';
-
-      const resp = await fetch('/api/benchmark', { method: 'POST' });
-      const data = await resp.json();
-      document.getElementById('btnRunBenchmark').disabled = false;
-      document.getElementById('benchmarkStatus').textContent = `Benchmark complete — ${data.total_scenarios} scenarios evaluated`;
-
-      document.getElementById('benchmarkResults').innerHTML = `
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px;">
-          <div style="text-align:center;padding:16px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">
-            <div style="font-size:28px;font-weight:700;color:var(--accent-green);font-family:var(--font-mono)">${data.defended_pass_rate}</div>
-            <div style="font-size:12px;color:var(--text-secondary)">Defended Pass Rate</div>
-          </div>
-          <div style="text-align:center;padding:16px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">
-            <div style="font-size:28px;font-weight:700;color:var(--accent-red);font-family:var(--font-mono)">${data.unsafe_breach_rate}</div>
-            <div style="font-size:12px;color:var(--text-secondary)">Unsafe Breach Rate</div>
-          </div>
-          <div style="text-align:center;padding:16px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">
-            <div style="font-size:28px;font-weight:700;color:var(--accent-blue);font-family:var(--font-mono)">${data.total_scenarios}</div>
-            <div style="font-size:12px;color:var(--text-secondary)">Scenarios Tested</div>
-          </div>
-          <div style="text-align:center;padding:16px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">
-            <div style="font-size:28px;font-weight:700;color:var(--accent-purple);font-family:var(--font-mono)">${data.avg_triage_latency_s}s</div>
-            <div style="font-size:12px;color:var(--text-secondary)">Avg Triage Latency</div>
-          </div>
-        </div>
-        <table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--font-mono);">
-          <thead>
-            <tr style="background:var(--bg-secondary);">
-              <th style="padding:8px 12px;text-align:left;color:var(--text-muted)">Scenario</th>
-              <th style="padding:8px 12px;text-align:center;color:var(--text-muted)">Defended</th>
-              <th style="padding:8px 12px;text-align:center;color:var(--text-muted)">Unsafe</th>
-              <th style="padding:8px 12px;text-align:right;color:var(--text-muted)">Latency</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${(data.scenarios||[]).map(s => `<tr style="border-bottom:1px solid var(--border)">
-              <td style="padding:8px 12px;color:var(--text-primary)">${s.scenario_name || s.scenario_id}</td>
-              <td style="padding:8px 12px;text-align:center"><span class="tag ${s.defended?.passed ? 'tag-allow':'tag-deny'}">${s.defended?.passed ? '✅ PASS':'❌ FAIL'}</span></td>
-              <td style="padding:8px 12px;text-align:center"><span class="tag ${s.unsafe_baseline?.breached ? 'tag-deny':'tag-allow'}">${s.unsafe_baseline?.breached ? '🚨 BREACH':'✅ SAFE'}</span></td>
-              <td style="padding:8px 12px;text-align:right;color:var(--text-secondary)">${s.defended?.triage_latency_s || '?'}s</td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      `;
-    }
-
-    // ── Helpers ────────────────────────────────────────────────────────────
-    function increment(id) {
-      const el = document.getElementById(id);
-      el.textContent = parseInt(el.textContent || '0') + 1;
-    }
-    function setGlobalStatus(state, text) {
-      document.getElementById('globalStatusDot').className = `status-dot ${state}`;
-      document.getElementById('globalStatusText').textContent = text;
-    }
-    function setExecStatus(state, text) {
-      document.getElementById('execStatusDot').className = `status-dot ${state}`;
-      document.getElementById('execStatusText').textContent = text;
-    }
-
-    // ── Integrations ──────────────────────────────────────────────────────────
-    async function checkIntegrationStatus() {
-      try {
-        const resp = await fetch('/api/integrations/status');
-        const data = await resp.json();
-
-        function badge(ok, label) {
-          const color = ok ? '#30d158' : '#ff453a';
-          const bg = ok ? 'rgba(48,209,88,0.12)' : 'rgba(255,69,58,0.12)';
-          const border = ok ? 'rgba(48,209,88,0.3)' : 'rgba(255,69,58,0.3)';
-          const icon = ok ? '✅' : '❌';
-          return `<div style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:${bg};color:${color};border:1px solid ${border};">${icon} ${label}</div>`;
-        }
-
-        const gemini = data.gemini_ai || {};
-        const brevo = data.brevo_email || {};
-        const tg = data.telegram || {};
-
-        document.getElementById('geminiStatusBadge').outerHTML = badge(gemini.configured, gemini.configured ? `Active — ${gemini.model}` : 'Not Configured');
-        document.getElementById('brevoStatusBadge').outerHTML = badge(brevo.configured, brevo.configured ? `Active — ${(brevo.admin_emails||[]).join(', ') || 'No emails set'}` : 'Not Configured');
-        document.getElementById('telegramStatusBadge').outerHTML = badge(tg.configured, tg.configured ? `Active — ${tg.chat_ids_count} chat(s)` : 'Not Configured');
-      } catch(e) {
-        console.error('Integration status check failed:', e);
-      }
-    }
-
-    async function testEmail() {
-      const resp = await fetch('/api/notify/test-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
-      const data = await resp.json();
-      alert(data.message || (data.success ? 'Email sent!' : 'Email failed — check BREVO_API_KEY and ADMIN_EMAILS in .env'));
-    }
-
-    async function testTelegram() {
-      const resp = await fetch('/api/notify/test-telegram', {method:'POST'});
-      const data = await resp.json();
-      alert(data.message || (data.success ? `Telegram sent to ${data.chats_reached} chat(s)!` : 'Failed — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in .env'));
-    }
-
-    async function pollTelegramUpdates() {
-      const el = document.getElementById('telegramPollResult');
-      el.textContent = '⏳ Polling for /start messages...';
-      try {
-        const resp = await fetch('/api/notify/telegram/updates');
-        const data = await resp.json();
-        if (data.new_chats_registered && data.new_chats_registered.length > 0) {
-          el.textContent = `✅ Registered ${data.new_chats_registered.length} new chat(s): ${data.new_chats_registered.join(', ')}`;
-          el.style.color = '#30d158';
-        } else {
-          el.textContent = `ℹ️ ${data.updates} update(s) found — no new /start commands. Send /start to your bot first.`;
-          el.style.color = 'var(--text-secondary)';
-        }
-      } catch(e) {
-        el.textContent = '❌ Poll failed: ' + e.message;
-        el.style.color = '#ff453a';
-      }
-    }
-
-    // ── Inline Chat (Integrations panel) ─────────────────────────────────────
-    let inlineChatTyping = null;
-
-    function addInlineMsg(role, text) {
-      const wrap = document.getElementById('inlineChatMessages');
-      if (inlineChatTyping && wrap.contains(inlineChatTyping)) {
-        wrap.removeChild(inlineChatTyping);
-        inlineChatTyping = null;
-      }
-      const div = document.createElement('div');
-      div.style.cssText = `align-self:${role==='user'?'flex-end':'flex-start'};max-width:88%;`;
-      const bg = role === 'user'
-        ? 'background:linear-gradient(135deg,#1d4ed8,#0369a1);color:#fff;border-bottom-right-radius:4px;'
-        : 'background:var(--bg-card);border:1px solid var(--border);color:var(--text-primary);border-bottom-left-radius:4px;';
-      div.innerHTML = `<div style="${bg}border-radius:12px;padding:10px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>')}</div>`;
-      wrap.appendChild(div);
-      wrap.scrollTop = wrap.scrollHeight;
-    }
-
-    function showInlineTyping() {
-      const wrap = document.getElementById('inlineChatMessages');
-      const div = document.createElement('div');
-      div.style.cssText = 'align-self:flex-start;';
-      div.innerHTML = `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;border-bottom-left-radius:4px;padding:10px 16px;display:flex;gap:5px;align-items:center;">
-        <span style="width:7px;height:7px;background:#2997ff;border-radius:50%;animation:bounce 1.2s infinite;display:inline-block;"></span>
-        <span style="width:7px;height:7px;background:#2997ff;border-radius:50%;animation:bounce 1.2s infinite 0.2s;display:inline-block;"></span>
-        <span style="width:7px;height:7px;background:#2997ff;border-radius:50%;animation:bounce 1.2s infinite 0.4s;display:inline-block;"></span>
-      </div>`;
-      wrap.appendChild(div);
-      inlineChatTyping = div;
-      wrap.scrollTop = wrap.scrollHeight;
-    }
-
-    async function sendInlineChat() {
-      const input = document.getElementById('inlineChatInput');
-      const msg = input.value.trim();
-      if (!msg) return;
-      input.value = '';
-      input.style.height = 'auto';
-      document.getElementById('inlineChatSendBtn').disabled = true;
-
-      addInlineMsg('user', msg);
-      showInlineTyping();
-
-      try {
-        const resp = await fetch('/api/chat', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({message: msg})
-        });
-        const data = await resp.json();
-        addInlineMsg('ai', data.response || 'No response received.');
-      } catch(e) {
-        addInlineMsg('ai', '⚠️ Connection error. Please try again.');
-      } finally {
-        document.getElementById('inlineChatSendBtn').disabled = false;
-        input.focus();
-      }
-    }
-
-    function inlineSuggest(text) {
-      document.getElementById('inlineChatInput').value = text;
-      sendInlineChat();
-    }
-
-    // Init
-    loadAuditTrail();
-    initChatbot();
-    checkIntegrationStatus();
-  </script>
-
-
-  <!-- ── AI Security Advisor Chatbot ─────────────────────────────────── -->
-  <style>
-    #chatWidget {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 9999;
-      font-family: var(--font-sans);
-    }
-    #chatToggle {
-      width: 56px;
-      height: 56px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #3b82f6, #06b6d4);
-      border: none;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 22px;
-      box-shadow: 0 4px 24px rgba(59,130,246,0.5);
-      transition: transform 0.2s, box-shadow 0.2s;
-      margin-left: auto;
-    }
-    #chatToggle:hover { transform: scale(1.08); box-shadow: 0 6px 32px rgba(59,130,246,0.7); }
-    #chatPanel {
-      display: none;
-      flex-direction: column;
-      width: 380px;
-      height: 520px;
-      background: #111827;
-      border: 1px solid #243050;
-      border-radius: 16px;
-      overflow: hidden;
-      margin-bottom: 12px;
-      box-shadow: 0 16px 48px rgba(0,0,0,0.6);
-      animation: slideUp 0.25s ease;
-    }
-    @keyframes slideUp {
-      from { opacity: 0; transform: translateY(20px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-    #chatPanel.open { display: flex; }
-    #chatHeader {
-      background: linear-gradient(135deg, #1e3a5f, #0d2137);
-      padding: 14px 18px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      border-bottom: 1px solid #243050;
-      flex-shrink: 0;
-    }
-    #chatHeader .chat-avatar {
-      width: 32px;
-      height: 32px;
-      background: linear-gradient(135deg, #3b82f6, #06b6d4);
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 16px;
-    }
-    #chatHeader .chat-title { font-size: 13px; font-weight: 600; color: #f9fafb; }
-    #chatHeader .chat-subtitle { font-size: 11px; color: #64748b; }
-    #chatHeader .clear-btn {
-      margin-left: auto;
-      background: none;
-      border: 1px solid #243050;
-      color: #64748b;
-      font-size: 11px;
-      padding: 4px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    #chatHeader .clear-btn:hover { color: #ef4444; border-color: #ef4444; }
-    #chatMessages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    #chatMessages::-webkit-scrollbar { width: 4px; }
-    #chatMessages::-webkit-scrollbar-track { background: transparent; }
-    #chatMessages::-webkit-scrollbar-thumb { background: #243050; border-radius: 2px; }
-    .chat-msg {
-      display: flex;
-      flex-direction: column;
-      max-width: 88%;
-      animation: fadeIn 0.2s ease;
-    }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    .chat-msg.user { align-self: flex-end; align-items: flex-end; }
-    .chat-msg.ai   { align-self: flex-start; align-items: flex-start; }
-    .chat-bubble {
-      padding: 10px 14px;
-      border-radius: 12px;
-      font-size: 13px;
-      line-height: 1.5;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .chat-msg.user .chat-bubble {
-      background: linear-gradient(135deg, #1d4ed8, #0369a1);
-      color: #fff;
-      border-bottom-right-radius: 4px;
-    }
-    .chat-msg.ai .chat-bubble {
-      background: #1a2236;
-      color: #d1d5db;
-      border: 1px solid #243050;
-      border-bottom-left-radius: 4px;
-    }
-    .chat-msg .chat-time { font-size: 10px; color: #4b5563; margin-top: 3px; }
-    #chatInput {
-      display: flex;
-      gap: 8px;
-      padding: 12px;
-      border-top: 1px solid #243050;
-      background: #0d1117;
-      flex-shrink: 0;
-    }
-    #chatInputField {
-      flex: 1;
-      background: #1a2236;
-      border: 1px solid #243050;
-      border-radius: 8px;
-      color: #f9fafb;
-      font-size: 13px;
-      padding: 8px 12px;
-      outline: none;
-      resize: none;
-      font-family: var(--font-sans);
-      transition: border-color 0.2s;
-      max-height: 100px;
-    }
-    #chatInputField:focus { border-color: #3b82f6; }
-    #chatSendBtn {
-      background: linear-gradient(135deg, #3b82f6, #06b6d4);
-      border: none;
-      border-radius: 8px;
-      color: #fff;
-      font-size: 16px;
-      padding: 8px 14px;
-      cursor: pointer;
-      transition: opacity 0.2s;
-    }
-    #chatSendBtn:hover { opacity: 0.85; }
-    #chatSendBtn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .chat-typing {
-      display: flex;
-      gap: 5px;
-      align-items: center;
-      padding: 8px 12px;
-      background: #1a2236;
-      border: 1px solid #243050;
-      border-radius: 12px;
-      border-bottom-left-radius: 4px;
-      width: fit-content;
-    }
-    .chat-typing span {
-      width: 7px;
-      height: 7px;
-      background: #3b82f6;
-      border-radius: 50%;
-      animation: bounce 1.2s infinite;
-    }
-    .chat-typing span:nth-child(2) { animation-delay: 0.2s; }
-    .chat-typing span:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes bounce {
-      0%, 60%, 100% { transform: translateY(0); }
-      30% { transform: translateY(-6px); }
-    }
-    .chat-suggestions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      padding: 0 16px 12px;
-      flex-shrink: 0;
-    }
-    .chat-suggestions button {
-      background: #1a2236;
-      border: 1px solid #243050;
-      border-radius: 20px;
-      color: #64748b;
-      font-size: 11px;
-      padding: 5px 12px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .chat-suggestions button:hover { border-color: #3b82f6; color: #3b82f6; }
-  </style>
-
-  <div id="chatWidget">
-    <div id="chatPanel">
-      <div id="chatHeader">
-        <div class="chat-avatar">🤖</div>
-        <div>
-          <div class="chat-title">AI Security Advisor</div>
-          <div class="chat-subtitle">Powered by Google Gemini</div>
-        </div>
-        <button class="clear-btn" onclick="clearChat()">🗑 Clear</button>
-      </div>
-      <div id="chatMessages">
-        <div class="chat-msg ai">
-          <div class="chat-bubble">👋 Hi! I'm your AI Security Advisor powered by Gemini.\n\nI can help you:\n• Analyze incidents & triage steps\n• Explain Policy Gate decisions\n• Interpret DLP violations\n• Review evaluation metrics\n• Answer cybersecurity questions\n\nWhat would you like to know?</div>
-          <div class="chat-time">now</div>
-        </div>
-      </div>
-      <div class="chat-suggestions">
-        <button onclick="sendSuggestion('Explain the Policy Gate BLOCK decision')">Policy Block?</button>
-        <button onclick="sendSuggestion('What are the 7 evaluation metrics?')">Metrics</button>
-        <button onclick="sendSuggestion('What is DLP and how does it work here?')">DLP</button>
-        <button onclick="sendSuggestion('How does the HITL approval workflow work?')">HITL</button>
-      </div>
-      <div id="chatInput">
-        <textarea id="chatInputField" placeholder="Ask about incidents, policies, DLP..." rows="1"
-          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}"
-          oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
-        <button id="chatSendBtn" onclick="sendChatMessage()">➤</button>
-      </div>
-    </div>
-    <button id="chatToggle" onclick="toggleChat()" title="AI Security Advisor">🤖</button>
-  </div>
-
-  <script>
-    let chatOpen = false;
-    let chatTypingEl = null;
-
-    function initChatbot() {
-      // Auto-open hint after 3s on first visit
-      if (!sessionStorage.getItem('chatHinted')) {
-        setTimeout(() => {
-          sessionStorage.setItem('chatHinted', '1');
-        }, 3000);
-      }
-    }
-
-    function toggleChat() {
-      chatOpen = !chatOpen;
-      document.getElementById('chatPanel').classList.toggle('open', chatOpen);
-      if (chatOpen) {
-        document.getElementById('chatInputField').focus();
-        scrollChatToBottom();
-      }
-    }
-
-    function clearChat() {
-      document.getElementById('chatMessages').innerHTML = '';
-      fetch('/api/chat/reset', { method: 'POST' });
-    }
-
-    function scrollChatToBottom() {
-      const msgs = document.getElementById('chatMessages');
-      msgs.scrollTop = msgs.scrollHeight;
-    }
-
-    function addChatMessage(role, text) {
-      const msgs = document.getElementById('chatMessages');
-      // Remove typing indicator if present
-      if (chatTypingEl && msgs.contains(chatTypingEl)) {
-        msgs.removeChild(chatTypingEl);
-        chatTypingEl = null;
-      }
-      const div = document.createElement('div');
-      div.className = `chat-msg ${role}`;
-      const now = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-      div.innerHTML = `
-        <div class="chat-bubble">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>')}</div>
-        <div class="chat-time">${now}</div>
-      `;
-      msgs.appendChild(div);
-      scrollChatToBottom();
-    }
-
-    function showTyping() {
-      const msgs = document.getElementById('chatMessages');
-      const div = document.createElement('div');
-      div.className = 'chat-msg ai';
-      div.innerHTML = '<div class="chat-typing"><span></span><span></span><span></span></div>';
-      msgs.appendChild(div);
-      chatTypingEl = div;
-      scrollChatToBottom();
-    }
-
-    async function sendChatMessage() {
-      const input = document.getElementById('chatInputField');
-      const msg = input.value.trim();
-      if (!msg) return;
-      input.value = '';
-      input.style.height = 'auto';
-      document.getElementById('chatSendBtn').disabled = true;
-
-      addChatMessage('user', msg);
-      showTyping();
-
-      try {
-        const resp = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: msg })
-        });
-        const data = await resp.json();
-        addChatMessage('ai', data.response || 'Sorry, I could not generate a response.');
-      } catch (err) {
-        addChatMessage('ai', '⚠️ Connection error. Please try again.');
-      } finally {
-        document.getElementById('chatSendBtn').disabled = false;
-        input.focus();
-      }
-    }
-
-    function sendSuggestion(text) {
-      document.getElementById('chatInputField').value = text;
-      sendChatMessage();
-    }
-  </script>
-</body>
-</html>"""
-
-
-# ── API Routes ────────────────────────────────────────────────────────────────
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    """Apple-style cinematic landing page."""
+# Downloadable CSV sample datasets for the live "Upload Dataset" demo feature.
+_csv_samples_dir = os.path.join(PROJECT_ROOT, "data", "csv_samples")
+if os.path.isdir(_csv_samples_dir):
+    app.mount("/samples", StaticFiles(directory=_csv_samples_dir), name="csv-samples")
+
+_FRONTEND_DIST = os.path.join(PROJECT_ROOT, "frontend", "dist")
+_FRONTEND_ASSETS = os.path.join(_FRONTEND_DIST, "assets")
+if os.path.isdir(_FRONTEND_ASSETS):
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_ASSETS), name="frontend-assets")
+
+
+# ── In-memory run state ────────────────────────────────────────────────────
+
+class RunChannel:
+    """Replayable, multi-subscriber event log for one run.
+
+    SSE subscribers read from an index instead of popping from a shared queue,
+    so a reconnect (network blip, React StrictMode's double-mount, a second
+    browser tab) replays the full history instead of silently losing events.
+    """
+
+    def __init__(self) -> None:
+        self.events: List[Dict[str, Any]] = []
+        self.done = False
+        self._cond = threading.Condition()
+
+    def publish(self, evt: Dict[str, Any]) -> None:
+        with self._cond:
+            self.events.append(evt)
+            if evt.get("type") == "done":
+                self.done = True
+            self._cond.notify_all()
+
+    def read_from(self, index: int, timeout: float) -> Tuple[List[Dict[str, Any]], bool]:
+        with self._cond:
+            if index >= len(self.events) and not self.done:
+                self._cond.wait(timeout)
+            return self.events[index:], self.done
+
+
+_channels: Dict[str, RunChannel] = {}
+_run_meta: Dict[str, Dict[str, Any]] = {}            # run_id -> metadata (status, source, label, ...)
+_pending_approvals: Dict[str, Dict[str, Any]] = {}   # "run_id:action_id" -> {event, approved}
+_benchmark_jobs: Dict[str, Dict[str, Any]] = {}      # job_id -> {status, result, created_at}
+_benchmark_lock = threading.Lock()
+
+_RUN_TTL_SECONDS = 3600
+_APPROVAL_TIMEOUT_SECONDS = 120
+_SAMPLES_DIR = os.path.join(PROJECT_ROOT, "data", "csv_samples")
+_SCENARIO_ROOTS = (os.path.join(PROJECT_ROOT, "data"), os.path.join(PROJECT_ROOT, "outputs", "uploads"))
+_UPLOAD_KINDS = ("tickets", "logs", "mixed")
+
+
+def _cleanup_stale_state() -> None:
+    """Evict finished run/benchmark state older than TTL to stop unbounded growth."""
+    now = time.time()
+    for rid in [r for r, m in _run_meta.items()
+                if m.get("status") != "running" and now - m.get("created_at", now) > _RUN_TTL_SECONDS]:
+        _run_meta.pop(rid, None)
+        _channels.pop(rid, None)
+    for jid in [j for j, m in _benchmark_jobs.items()
+                if m.get("status") != "running" and now - m.get("created_at", now) > _RUN_TTL_SECONDS]:
+        _benchmark_jobs.pop(jid, None)
+
+
+def _safe_scenario_path(path: str) -> str:
+    """Resolve a client-supplied scenario path, refusing anything outside data/ or
+    outputs/uploads/ — the API must never become an arbitrary-file reader."""
+    candidate = os.path.realpath(path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path))
+    for root in _SCENARIO_ROOTS:
+        root_real = os.path.realpath(root)
+        try:
+            inside = os.path.commonpath([candidate, root_real]) == root_real
+        except ValueError:  # different drives on Windows
+            inside = False
+        if inside and candidate.lower().endswith(".json"):
+            if not os.path.isfile(candidate):
+                raise HTTPException(404, detail="Scenario file not found.")
+            return candidate
+    raise HTTPException(400, detail="scenario_path must point to a .json scenario under data/.")
+
+
+def _authorized_hosts() -> List[str]:
+    from src.policy import TOOL_POLICY_REGISTRY
+    return list(TOOL_POLICY_REGISTRY["simulate_endpoint_isolation"].get("authorized_hosts", []))
+
+
+def _all_audit_log_paths() -> List[str]:
+    paths = ["outputs/audit_trail.jsonl", "outputs/benchmark_audit_trail.jsonl"]
+    if os.path.isdir("outputs"):
+        for f in sorted(os.listdir("outputs")):
+            if f.startswith("dashboard_") and f.endswith(".jsonl"):
+                paths.append(f"outputs/{f}")
+    return paths
+
+
+def _load_all_audit_events(run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    from src.reporting import ReportGenerator
+    events: List[Dict[str, Any]] = []
+    for path in _all_audit_log_paths():
+        if os.path.exists(path):
+            events.extend(ReportGenerator.load_audit_trail_jsonl(path, run_id=run_id))
+    return events
+
+
+def _events_for_run(run_id: str) -> List[Dict[str, Any]]:
+    """Audit events for one run — from the live channel while it's in memory (so the
+    graph/replay/report views work mid-run), otherwise from the JSONL logs on disk."""
+    channel = _channels.get(run_id)
+    if channel is not None:
+        events = [e for e in channel.events if "event_type" in e]
+        if events:
+            return events
+    return _load_all_audit_events(run_id=run_id)
+
+
+def _find_scenario_path_by_id(scenario_id: Optional[str]) -> Optional[str]:
+    if not scenario_id:
+        return None
+    from src.benchmark import discover_scenarios
+    candidates = discover_scenarios("data/incident_scenarios") + ["data/incident_scenario.json"]
+    if scenario_id.startswith("UPLOADED-"):
+        candidates.append(f"outputs/uploads/{scenario_id[len('UPLOADED-'):]}.json")
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("scenario_metadata", {}).get("scenario_id") == scenario_id:
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_scenario_for_run(run_id: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Best-effort: recover the originating scenario JSON for a run, for graph/report enrichment."""
+    scenario_path = _run_meta.get(run_id, {}).get("scenario_path")
+    if not scenario_path or not os.path.exists(scenario_path):
+        scenario_loaded = next((e for e in events if e.get("event_type") == "SCENARIO_LOADED"), None)
+        scenario_id = scenario_loaded.get("details", {}).get("scenario_id") if scenario_loaded else None
+        scenario_path = _find_scenario_path_by_id(scenario_id)
+    if not scenario_path or not os.path.exists(scenario_path):
+        return None
     try:
-        from src.landing import LANDING_HTML
-        return HTMLResponse(LANDING_HTML)
-    except ImportError:
-        # Fallback if landing module unavailable
-        return HTMLResponse('<meta http-equiv="refresh" content="0;url=/dashboard">')
+        with open(scenario_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page():
-    """Main security operations dashboard."""
-    return HTMLResponse(DASHBOARD_HTML)
+def _load_samples_manifest() -> List[Dict[str, Any]]:
+    path = os.path.join(_SAMPLES_DIR, "manifest.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f).get("samples", [])
+
+
+def _launch_run(
+    *,
+    mode: str,
+    run_kwargs: Dict[str, Any],
+    meta: Dict[str, Any],
+    expected_outcome: Optional[Dict[str, Any]] = None,
+    auto_approve: bool = False,
+    ground_truth: Optional[Dict[str, Any]] = None,
+    preview: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Start a run on a background thread with a replayable live channel.
+
+    One code path for curated scenarios, CSV uploads and one-click samples, so
+    they all get identical live streaming, HITL handling, metrics and grading.
+    """
+    _cleanup_stale_state()
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    channel = RunChannel()
+    _channels[run_id] = channel
+    _run_meta[run_id] = {
+        "run_id": run_id, "created_at": time.time(), "status": "running", "exit_code": None,
+        "passed": None, "auto_approve": auto_approve, "has_ground_truth": ground_truth is not None,
+        **meta,
+    }
+
+    def approval_provider(action) -> ApprovalToken:
+        key = f"{run_id}:{action.action_id}"
+        ev = threading.Event()
+        _pending_approvals[key] = {"event": ev, "approved": False}
+        channel.publish({
+            "type": "approval_required", "run_id": run_id, "action_id": action.action_id,
+            "tool_name": action.tool_name, "arguments": action.arguments,
+            "timeout_s": _APPROVAL_TIMEOUT_SECONDS,
+        })
+        resolved_in_time = ev.wait(timeout=_APPROVAL_TIMEOUT_SECONDS)
+        entry = _pending_approvals.pop(key, {"approved": False})
+        approved = bool(resolved_in_time and entry.get("approved"))
+        channel.publish({
+            "type": "approval_resolved", "run_id": run_id, "action_id": action.action_id,
+            "approved": approved, "timed_out": not resolved_in_time,
+        })
+        return ApprovalToken(
+            token_id=f"tok-{uuid.uuid4().hex[:6]}", action_id=action.action_id,
+            tool_name=action.tool_name, approver_id="dashboard_operator", approved=approved,
+        )
+
+    kwargs = dict(
+        run_kwargs,
+        on_event=channel.publish,
+        run_id=run_id,
+        audit_log_path=f"outputs/dashboard_{run_id}.jsonl",
+        report_path=f"outputs/dashboard_{run_id}.md",
+        notify=True,
+    )
+
+    def do_run():
+        from src.main import run_incident_orchestration, run_advisory_orchestration
+        from src.evaluation import Evaluator
+        try:
+            if mode == "incident":
+                if not auto_approve:
+                    kwargs["approval_provider"] = approval_provider
+                exit_code = run_incident_orchestration(**kwargs)
+            else:
+                exit_code = run_advisory_orchestration(**kwargs)
+
+            events = [e for e in channel.events if "event_type" in e]
+            metrics = Evaluator(run_id=run_id).evaluate_run(events, expected_outcome).metrics
+            done: Dict[str, Any] = {
+                "type": "done", "passed": exit_code == 0, "run_id": run_id,
+                "exit_code": exit_code, "metrics": metrics,
+            }
+            if mode == "incident" and (ground_truth is not None or preview is not None):
+                from src.accuracy import grade_run
+                done["accuracy"] = grade_run(events, preview, ground_truth)
+            _run_meta[run_id].update(status="done", exit_code=exit_code, passed=exit_code == 0, metrics=metrics)
+            channel.publish(done)
+        except Exception as e:
+            logger.exception("Run %s failed", run_id)
+            _run_meta[run_id].update(status="error", error=str(e), passed=False)
+            channel.publish({"type": "done", "passed": False, "run_id": run_id, "error": str(e),
+                             "exit_code": -1, "metrics": {}})
+
+    _run_meta[run_id]["_ground_truth"] = ground_truth
+    _run_meta[run_id]["_preview"] = preview
+    threading.Thread(target=do_run, daemon=True, name=f"run-{run_id}").start()
+    return run_id
+
+
+def _public_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in meta.items() if not k.startswith("_")}
+
+
+# ── Scenario Runs ────────────────────────────────────────────────────────────
+
+@app.get("/api/scenarios")
+def list_scenarios():
+    """Dynamic scenario catalog, discovered from data/incident_scenarios/."""
+    from src.benchmark import discover_scenarios
+    out = []
+    for path in discover_scenarios("data/incident_scenarios"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        meta = data.get("scenario_metadata", {})
+        ti = meta.get("threat_intelligence", {})
+        out.append({
+            "scenario_id": meta.get("scenario_id", os.path.basename(path)),
+            "name": meta.get("name", os.path.basename(path)),
+            "domain": meta.get("domain", "IT Infrastructure"),
+            "severity": data.get("incident", {}).get("severity", "high"),
+            "cvss_v3_threat_score": ti.get("cvss_v3_threat_score"),
+            "mitre_techniques": ti.get("mitre_attack", {}).get("techniques", []),
+            "owasp_llm": ti.get("owasp_llm_top10", []),
+            "injection_category": ti.get("injection_category", "unknown"),
+            "path": path.replace("\\", "/"),
+        })
+    return JSONResponse({"scenarios": out})
 
 
 @app.post("/api/run")
 async def start_run(request: Request):
-    """Kick off an incident or advisory scenario run asynchronously."""
+    """Kick off an incident or advisory scenario run with live SSE + working HITL."""
     body = await request.json()
     mode = body.get("mode", "incident")
-    scenario_path = body.get("scenario_path", "data/incident_scenario.json")
-    adversarial = body.get("adversarial", False)
-    disable_policy_gate = body.get("disable_policy_gate", False)
+    if mode not in ("incident", "advisory"):
+        raise HTTPException(400, detail="mode must be 'incident' or 'advisory'.")
+    disable_policy_gate = bool(body.get("disable_policy_gate", False))
+    auto_approve = bool(body.get("auto_approve", False))
 
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
-    q: queue.Queue = queue.Queue()
-    _event_queues[run_id] = q
-
-    def do_run():
-        import io
-        from contextlib import redirect_stdout
-        try:
-            from src.main import run_incident_orchestration, run_advisory_orchestration
-
-            audit_path = f"outputs/dashboard_{run_id}.jsonl"
-            report_path = f"outputs/dashboard_{run_id}.md"
-
-            # Monkey-patch to intercept events
-            # Use a simple wrapper to emit events
-            if mode == "incident":
-                exit_code = run_incident_orchestration(
-                    scenario_path=scenario_path,
-                    auto_approve=True,
-                    interactive_approval=False,
-                    disable_policy_gate=disable_policy_gate,
-                    audit_log_path=audit_path,
-                    report_path=report_path
-                )
-            else:
-                exit_code = run_advisory_orchestration(
-                    force_offline=True,
-                    adversarial=adversarial,
-                    scenario_path="data/vulnerability_scenario_adversarial.json" if adversarial else None,
-                    disable_policy_gate=disable_policy_gate,
-                    audit_log_path=audit_path,
-                    report_path=report_path
-                )
-
-            # Load events from the written JSONL and emit them
-            from src.reporting import ReportGenerator
-            events = ReportGenerator.load_audit_trail_jsonl(audit_path, run_id=None)
-            for evt in events:
-                q.put(evt)
-
-            # Send completion event
-            q.put({"type": "done", "passed": exit_code == 0,
-                   "run_id": run_id, "exit_code": exit_code,
-                   "metrics": _run_results.get(run_id, {})})
-        except Exception as e:
-            q.put({"type": "done", "passed": False, "run_id": run_id,
-                   "error": str(e), "exit_code": -1, "metrics": {}})
-
-    threading.Thread(target=do_run, daemon=True).start()
+    if mode == "incident":
+        scenario_path = _safe_scenario_path(body.get("scenario_path", "data/incident_scenario.json"))
+        with open(scenario_path, "r", encoding="utf-8") as f:
+            scenario_data = json.load(f)
+        run_id = _launch_run(
+            mode="incident",
+            run_kwargs={"scenario_data": scenario_data, "disable_policy_gate": disable_policy_gate},
+            meta={"source": "scenario", "scenario_path": scenario_path,
+                  "scenario_id": scenario_data.get("scenario_metadata", {}).get("scenario_id"),
+                  "label": scenario_data.get("scenario_metadata", {}).get("name", "Scenario run"),
+                  "disable_policy_gate": disable_policy_gate},
+            expected_outcome=scenario_data.get("incident", {}).get("expected_outcome"),
+            auto_approve=auto_approve,
+        )
+    else:
+        adversarial = bool(body.get("adversarial", False))
+        run_id = _launch_run(
+            mode="advisory",
+            run_kwargs={
+                "force_offline": True, "adversarial": adversarial,
+                "scenario_path": "data/vulnerability_scenario_adversarial.json" if adversarial else None,
+                "disable_policy_gate": disable_policy_gate,
+            },
+            meta={"source": "advisory", "label": "Vulnerability advisory triage",
+                  "disable_policy_gate": disable_policy_gate},
+        )
     return JSONResponse({"run_id": run_id, "status": "started"})
 
 
+def _start_dataset_run(
+    csv_text: str, kind: str, affected_host: str, auto_approve: bool, disable_policy_gate: bool,
+    label: str, source: str, ground_truth: Optional[Dict[str, Any]] = None, sample_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    from src.csv_ingest import parse_csv_to_scenario, CsvIngestError
+
+    if kind not in _UPLOAD_KINDS:
+        raise HTTPException(400, detail=f"kind must be one of {', '.join(_UPLOAD_KINDS)}.")
+    if affected_host not in _authorized_hosts():
+        raise HTTPException(400, detail=f"affected_host must be one of the managed hosts: {', '.join(_authorized_hosts())}.")
+    try:
+        scenario_data, preview = parse_csv_to_scenario(
+            csv_text, kind=kind, affected_host=affected_host, ground_truth=ground_truth)
+    except CsvIngestError as e:
+        raise HTTPException(400, detail=str(e))
+
+    os.makedirs("outputs/uploads", exist_ok=True)
+    incident_id = scenario_data["incident"]["incident_id"]
+    scenario_path = os.path.realpath(f"outputs/uploads/{incident_id}.json")
+    with open(scenario_path, "w", encoding="utf-8") as f:
+        json.dump(scenario_data, f, indent=2)
+
+    run_id = _launch_run(
+        mode="incident",
+        run_kwargs={"scenario_data": scenario_data, "disable_policy_gate": disable_policy_gate},
+        meta={"source": source, "scenario_path": scenario_path, "label": label, "sample_id": sample_id,
+              "scenario_id": scenario_data["scenario_metadata"]["scenario_id"], "incident_id": incident_id,
+              "disable_policy_gate": disable_policy_gate, "rows_ingested": len(preview)},
+        expected_outcome=scenario_data["incident"]["expected_outcome"],
+        auto_approve=auto_approve,
+        ground_truth=ground_truth,
+        preview=preview,
+    )
+    return {
+        "run_id": run_id,
+        "status": "started",
+        "incident_id": incident_id,
+        "rows_ingested": len(preview),
+        "flagged_suspicious_count": sum(1 for p in preview if p["flagged_suspicious"]),
+        "preview": preview,
+        "ground_truth": ground_truth,
+    }
+
+
+@app.post("/api/upload")
+async def upload_dataset(
+    file: UploadFile = File(...),
+    kind: str = Form("tickets"),
+    affected_host: str = Form("srv-pay-prod-02"),
+    auto_approve: bool = Form(False),
+):
+    """Upload an arbitrary CSV of tickets/logs, assemble it into a real scenario, and run
+    it through the exact same Policy Gate pipeline as the bundled scenarios."""
+    from src.csv_ingest import MAX_UPLOAD_BYTES
+
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, detail=f"CSV too large (max {MAX_UPLOAD_BYTES // 1024 // 1024} MB).")
+    try:
+        csv_text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        csv_text = raw.decode("latin-1")
+
+    result = await asyncio.to_thread(
+        _start_dataset_run, csv_text, kind, affected_host, auto_approve, False,
+        f"Upload: {file.filename or 'dataset.csv'}", "upload",
+    )
+    return JSONResponse(result)
+
+
+@app.get("/api/samples")
+def list_samples():
+    """Labeled synthetic datasets for one-click live runs (data/csv_samples/manifest.json)."""
+    out = []
+    for s in _load_samples_manifest():
+        path = os.path.join(_SAMPLES_DIR, s["file"])
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            rows = max(sum(1 for _ in f) - 1, 0)
+        gt = s.get("ground_truth", {})
+        out.append({
+            "id": s["id"], "title": s["title"], "description": s["description"], "kind": s["kind"],
+            "affected_host": s["affected_host"], "difficulty": s.get("difficulty"), "highlight": s.get("highlight"),
+            # Use the dedicated download endpoint (forces Content-Disposition: attachment)
+            "file": s["file"], "download_url": f"/api/samples/{s['file']}/download", "rows": rows,
+            "expected_injected_rows": len(gt.get("injected_rows", [])),
+            "expected_injected_tools": sum(len(r["tools"]) for r in gt.get("injected_rows", [])),
+            "containment_required": gt.get("containment_required", False),
+            "mitre_techniques": gt.get("mitre_techniques", []),
+        })
+    return JSONResponse({"samples": out, "hosts": _authorized_hosts()})
+
+
+@app.get("/api/samples/{filename}/download")
+def download_sample_csv(filename: str):
+    """Download a sample CSV file with proper Content-Disposition: attachment header.
+
+    This forces browsers to download the file instead of previewing/opening it.
+    The static /samples/ mount gives application/vnd.ms-excel which some browsers
+    open inline — this endpoint always triggers a true file download.
+    """
+    # Sanitise filename — strip path traversal attempts
+    safe_name = os.path.basename(filename)
+    if not safe_name.endswith(".csv"):
+        raise HTTPException(400, detail="Only .csv files can be downloaded.")
+    path = os.path.join(_SAMPLES_DIR, safe_name)
+    if not os.path.exists(path):
+        raise HTTPException(404, detail=f"Sample file '{safe_name}' not found.")
+    return FileResponse(
+        path=path,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+
+@app.post("/api/samples/{sample_id}/run")
+async def run_sample(sample_id: str, request: Request):
+    """One-click: ingest a bundled labeled dataset and run it live, graded against its labels."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sample = next((s for s in _load_samples_manifest() if s["id"] == sample_id), None)
+    if not sample:
+        raise HTTPException(404, detail="Unknown sample dataset.")
+    with open(os.path.join(_SAMPLES_DIR, sample["file"]), "r", encoding="utf-8") as f:
+        csv_text = f.read()
+
+    result = await asyncio.to_thread(
+        _start_dataset_run, csv_text, sample["kind"], sample["affected_host"],
+        bool(body.get("auto_approve", False)), bool(body.get("disable_policy_gate", False)),
+        sample["title"], "sample", sample.get("ground_truth"), sample_id,
+    )
+    return JSONResponse(result)
+
+
 @app.get("/api/events/{run_id}")
-async def event_stream(run_id: str):
-    """SSE stream for live execution events."""
-    q = _event_queues.get(run_id)
-    if not q:
-        raise HTTPException(404, detail="Run ID not found")
+async def event_stream(run_id: str, request: Request):
+    """Replayable SSE stream of a run's events (supports reconnect via Last-Event-ID)."""
+    channel = _channels.get(run_id)
+    if channel is None:
+        raise HTTPException(404, detail="Run ID not found (may have already finished and been evicted).")
+
+    try:
+        index = int(request.headers.get("last-event-id", "-1")) + 1
+    except ValueError:
+        index = 0
 
     async def generate():
+        nonlocal index
+        yield "retry: 2000\n\n"
         while True:
-            try:
-                event = await asyncio.get_event_loop().run_in_executor(None, q.get, True, 1.0)
-                yield f"data: {json.dumps(event)}\n\n"
-                if event.get("type") == "done":
+            if await request.is_disconnected():
+                break
+            new_events, done = await asyncio.to_thread(channel.read_from, index, 15.0)
+            if not new_events:
+                if done:
                     break
-            except Exception:
+                yield ": keepalive\n\n"
                 continue
+            for evt in new_events:
+                yield f"id: {index}\ndata: {json.dumps(evt, default=str)}\n\n"
+                index += 1
+            if done and index >= len(channel.events):
+                break
 
     return StreamingResponse(generate(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+
+@app.post("/api/approve/{run_id}")
+async def submit_approval(run_id: str, request: Request):
+    """Submit a real Human-in-the-Loop approval decision — actually unblocks the waiting run."""
+    body = await request.json()
+    approved = bool(body.get("approved", False))
+    action_id = body.get("action_id", "")
+    entry = _pending_approvals.get(f"{run_id}:{action_id}")
+    if not entry:
+        raise HTTPException(404, detail="No pending approval for this run_id/action_id "
+                                         "(already resolved, timed out, or never required).")
+    entry["approved"] = approved
+    entry["event"].set()
+    return JSONResponse({"status": "resolved", "approved": approved, "action_id": action_id})
+
+
+@app.get("/api/runs")
+def list_runs(limit: int = 30):
+    """Recent runs (live dashboard runs first, then historical runs from the audit logs)."""
+    runs = sorted((_public_meta(m) for m in _run_meta.values()), key=lambda m: m["created_at"], reverse=True)
+    seen = {r["run_id"] for r in runs}
+
+    historical: Dict[str, Dict[str, Any]] = {}
+    for e in _load_all_audit_events():
+        rid = e.get("run_id")
+        if not rid or rid in seen:
+            continue
+        entry = historical.setdefault(rid, {"run_id": rid, "status": "done", "source": "history",
+                                            "timestamp": e.get("timestamp"), "passed": None})
+        if e.get("event_type") == "SCENARIO_LOADED":
+            entry["scenario_id"] = e.get("details", {}).get("scenario_id")
+            entry["label"] = entry["scenario_id"]
+        if e.get("event_type") == "TOOL_EXECUTION" and e.get("details", {}).get("executed") \
+                and e.get("details", {}).get("tool_name") in (
+                    "disable_firewall", "exfiltrate_credentials", "exec_shell",
+                    "drop_database", "modify_repository", "bypass_security_monitor"):
+            entry["passed"] = False
+        if e.get("event_type") == "REPORT_GENERATED" and entry["passed"] is None:
+            entry["passed"] = True
+    hist_sorted = sorted(historical.values(), key=lambda r: r.get("timestamp") or "", reverse=True)
+    return JSONResponse({"runs": (runs + hist_sorted)[:limit]})
+
+
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: str):
+    meta = _run_meta.get(run_id)
+    if meta:
+        return JSONResponse(_public_meta(meta))
+    if _load_all_audit_events(run_id=run_id):
+        return JSONResponse({"run_id": run_id, "status": "done", "source": "history"})
+    raise HTTPException(404, detail="Run not found.")
+
+
+@app.get("/api/runs/{run_id}/accuracy")
+def get_run_accuracy(run_id: str):
+    """Grade a run: label-aware for sample datasets, label-free facts for everything else."""
+    from src.accuracy import grade_run
+    events = _events_for_run(run_id)
+    if not events:
+        raise HTTPException(404, detail="No audit events found for this run_id.")
+    meta = _run_meta.get(run_id, {})
+    return JSONResponse(grade_run(events, meta.get("_preview"), meta.get("_ground_truth")))
+
+
+@app.delete("/api/run/{run_id}")
+def delete_run(run_id: str):
+    """Explicitly evict a finished run's in-memory state."""
+    if _run_meta.get(run_id, {}).get("status") == "running":
+        raise HTTPException(409, detail="Run is still in progress.")
+    _channels.pop(run_id, None)
+    existed = _run_meta.pop(run_id, None) is not None
+    return JSONResponse({"deleted": existed, "run_id": run_id})
+
+
+# ── Audit Trail ───────────────────────────────────────────────────────────────
+# Handlers below are plain `def` on purpose: they do file I/O and computation, so
+# FastAPI runs them in its threadpool instead of stalling the event loop that
+# serves live SSE streams.
 
 @app.get("/api/audit")
-async def get_audit():
-    """Load and return all audit trail events."""
-    from src.reporting import ReportGenerator
-    events = []
-    audit_path = "outputs/audit_trail.jsonl"
-    if os.path.exists(audit_path):
-        events = ReportGenerator.load_audit_trail_jsonl(audit_path)
-    # Also load any dashboard runs
-    for f in os.listdir("outputs") if os.path.isdir("outputs") else []:
-        if f.startswith("dashboard_") and f.endswith(".jsonl"):
-            events.extend(ReportGenerator.load_audit_trail_jsonl(f"outputs/{f}"))
-    events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
-    return JSONResponse({"events": events[:500]})
+def get_audit(run_id: Optional[str] = None, event_type: Optional[str] = None,
+              page: int = 1, page_size: int = 100):
+    """Paginated, filterable audit trail browser."""
+    events = _events_for_run(run_id) if run_id else _load_all_audit_events()
+    if event_type:
+        events = [e for e in events if e.get("event_type") == event_type]
+    events = sorted(events, key=lambda e: e.get("timestamp", ""), reverse=True)
 
+    total = len(events)
+    page = max(page, 1)
+    page_size = max(min(page_size, 1000), 1)
+    start = (page - 1) * page_size
+    return JSONResponse({"events": events[start:start + page_size], "total": total, "page": page})
+
+
+@app.get("/api/replay/{run_id}")
+def get_replay(run_id: str):
+    """Ordered audit events for a single run, for the Attack Replay scrubber."""
+    events = _events_for_run(run_id)
+    if not events:
+        raise HTTPException(404, detail="No audit events found for this run_id.")
+    return JSONResponse({"events": sorted(events, key=lambda e: (e.get("timestamp", ""), e.get("event_id", "")))})
+
+
+# ── Attack Graph (GraphSAGE-style risk propagation) ──────────────────────────
+
+@app.get("/api/graph/{run_id}")
+def get_graph(run_id: str):
+    """Node/edge graph + propagated risk scores + attack paths for the 3D explorer."""
+    from src.graph_risk import analyze_run
+
+    events = _events_for_run(run_id)
+    if not events:
+        raise HTTPException(404, detail="No audit events found for this run_id.")
+
+    scenario = _resolve_scenario_for_run(run_id, events)
+    evidence = scenario.get("incident", {}).get("evidence") if scenario else None
+    campaign = scenario.get("adversarial_campaign") if scenario else None
+    return JSONResponse(analyze_run(events, evidence=evidence, campaign=campaign))
+
+
+# ── Executive Report ──────────────────────────────────────────────────────────
+
+@app.get("/api/report/{run_id}/executive")
+def get_executive_report(run_id: str):
+    """Auto-generated structured executive summary: headline, blast radius, key metrics, actions."""
+    from src.evaluation import Evaluator
+    from src.graph_risk import analyze_run
+    from src.accuracy import grade_run
+
+    events = sorted(_events_for_run(run_id), key=lambda e: e.get("timestamp", ""))
+    if not events:
+        raise HTTPException(404, detail="No audit events found for this run_id.")
+
+    scenario = _resolve_scenario_for_run(run_id, events)
+    expected_outcome = scenario.get("incident", {}).get("expected_outcome") if scenario else None
+    evidence = scenario.get("incident", {}).get("evidence") if scenario else None
+    campaign = scenario.get("adversarial_campaign") if scenario else None
+    incident_meta = scenario.get("incident", {}) if scenario else {}
+
+    eval_result = Evaluator(run_id=run_id).evaluate_run(events, expected_outcome)
+    graph = analyze_run(events, evidence=evidence, campaign=campaign)
+    meta = _run_meta.get(run_id, {})
+    accuracy = grade_run(events, meta.get("_preview"), meta.get("_ground_truth"))
+
+    report_evt = next((e for e in events if e.get("event_type") == "REPORT_GENERATED"), None)
+    report_details = report_evt.get("details", {}) if report_evt else {}
+
+    title = incident_meta.get("title", "Incident")
+    attempts = eval_result.prohibited_action_attempts
+    if eval_result.unauthorized_actions_executed > 0:
+        headline = (f"{title}: {eval_result.unauthorized_actions_executed} of {attempts} injected action(s) "
+                    "EXECUTED — the sandbox was breached.")
+    elif attempts > 0:
+        headline = f"{title}: all {attempts} injected action(s) were blocked by the Policy Gate."
+    else:
+        headline = f"{title}: no prompt-injection attempts found; triage completed normally."
+
+    timeline_highlights = []
+    for e in events:
+        d = e.get("details", {})
+        if e.get("event_type") == "POLICY_DECISION" and d.get("decision") != "allow" or e.get("event_type") == "DLP_INSPECTION":
+            timeline_highlights.append({
+                "timestamp": e.get("timestamp"),
+                "event_type": e.get("event_type"),
+                "tool_name": d.get("tool_name"),
+                "summary": d.get("reason") or d.get("summary"),
+            })
+
+    return JSONResponse({
+        "headline": headline,
+        "severity": incident_meta.get("severity", "high"),
+        "blast_radius_score": graph["blast_radius_score"],
+        "key_metrics": eval_result.metrics,
+        "timeline_highlights": timeline_highlights,
+        "recommended_actions": report_details.get("recommended_next_steps") or [
+            "Review the audit trail for the full decision sequence."
+        ],
+        "root_cause_analysis": report_details.get("root_cause_analysis"),
+        "containment_status": report_details.get("containment_status"),
+        "accuracy": accuracy,
+    })
+
+
+# ── Policy Gate What-If Simulator ────────────────────────────────────────────
+
+_PROHIBITED_TOOL_NAMES = (
+    "disable_firewall", "exfiltrate_credentials", "exec_shell",
+    "drop_database", "modify_repository", "bypass_security_monitor",
+)
+
+
+def _run_simulation(body: Dict[str, Any]) -> Dict[str, Any]:
+    from src.main import run_incident_orchestration
+    from src.policy import TOOL_POLICY_REGISTRY
+    from src.evaluation import Evaluator
+    from src.schemas import RiskLevel
+
+    scenario_path = _safe_scenario_path(body.get("scenario_path") or "")
+    disable_dlp = bool(body.get("disable_dlp", False))
+    disable_hitl = bool(body.get("disable_hitl", False))
+    tool_to_remove = body.get("remove_from_allowlist") or body.get("disable_tool") or None
+    tool_to_allow = body.get("allow_prohibited_tool") or None
+
+    with open(scenario_path, "r", encoding="utf-8") as f:
+        scenario_data = json.load(f)
+    expected_outcome = scenario_data.get("incident", {}).get("expected_outcome")
+
+    # Modified policy lives only in this copy — concurrent real runs keep the real allowlist.
+    registry = copy.deepcopy(TOOL_POLICY_REGISTRY)
+    if tool_to_remove:
+        if tool_to_remove not in registry:
+            raise HTTPException(400, detail=f"'{tool_to_remove}' is not in the allowlist.")
+        registry.pop(tool_to_remove)
+    if disable_hitl:
+        for cfg in registry.values():
+            cfg["requires_approval"] = False
+    if tool_to_allow:
+        if tool_to_allow not in _PROHIBITED_TOOL_NAMES:
+            raise HTTPException(400, detail=f"allow_prohibited_tool must be one of {', '.join(_PROHIBITED_TOOL_NAMES)}.")
+        # Simulates an operator misconfiguring the allowlist to admit an attacker-favoured tool.
+        registry[tool_to_allow] = {
+            "risk_level": RiskLevel.LOW, "requires_approval": False, "allowed_roles": ["incident_triage"],
+            "required_args": ["host"], "optional_args": ["zone", "directive"],
+        }
+
+    def run_once(policy_registry: Optional[Dict[str, Any]], enable_dlp: bool) -> Dict[str, Any]:
+        rid = f"sim-{uuid.uuid4().hex[:8]}"
+        events: List[Dict[str, Any]] = []
+        audit_path, report_path = f"outputs/simulate_{rid}.jsonl", f"outputs/simulate_{rid}.md"
+        run_incident_orchestration(
+            scenario_data=scenario_data, audit_log_path=audit_path, report_path=report_path,
+            run_id=rid, enable_dlp=enable_dlp, policy_registry=policy_registry, on_event=events.append,
+        )
+        for p in (audit_path, report_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return {"events": events, "metrics": Evaluator(run_id=rid).evaluate_run(events, expected_outcome).metrics}
+
+    baseline = run_once(None, enable_dlp=True)
+    modified = run_once(registry, enable_dlp=not disable_dlp)
+
+    decision_trace = [
+        {"event_type": e["event_type"], **e["details"]} for e in modified["events"]
+        if e.get("event_type") in ("ACTION_PROPOSED", "POLICY_DECISION", "TOOL_EXECUTION", "DLP_INSPECTION")
+    ]
+    return {
+        "decision_trace": decision_trace,
+        "metrics": modified["metrics"],
+        "baseline_metrics": baseline["metrics"],
+        "toggles_applied": {
+            "disable_dlp": disable_dlp, "disable_hitl": disable_hitl,
+            "remove_from_allowlist": tool_to_remove, "allow_prohibited_tool": tool_to_allow,
+        },
+    }
+
+
+@app.post("/api/simulate")
+async def simulate_what_if(request: Request):
+    """Run a scenario twice (real policy vs. a modified copy) and diff the metrics."""
+    body = await request.json()
+    return JSONResponse(await asyncio.to_thread(_run_simulation, body))
+
+
+# ── Policy Gate & DLP Introspection ───────────────────────────────────────────
 
 @app.get("/api/policy")
 async def get_policy():
@@ -1905,27 +888,242 @@ async def inspect_dlp(request: Request):
     })
 
 
+# ── Multi-Scenario Benchmark (background job) ────────────────────────────────
+
 @app.post("/api/benchmark")
-async def run_benchmark_api():
-    """Run multi-scenario benchmark and return results."""
-    from src.benchmark import run_benchmark
-    results = run_benchmark(
-        scenarios_dir="data/incident_scenarios",
-        include_unsafe_baseline=True,
-        audit_log_path="outputs/benchmark_audit.jsonl",
-        report_dir="outputs/benchmark_reports"
+def start_benchmark():
+    """Start the multi-scenario benchmark as a background job. Single-flight: a second
+    request while one is running returns the running job instead of racing it on
+    the shared benchmark audit log."""
+    from src.benchmark import discover_scenarios
+
+    with _benchmark_lock:
+        running = next((jid for jid, j in _benchmark_jobs.items() if j["status"] == "running"), None)
+        if running:
+            return JSONResponse({"job_id": running, "status": "running", "already_running": True})
+        _cleanup_stale_state()
+        job_id = f"bench-{uuid.uuid4().hex[:8]}"
+        total = len(discover_scenarios("data/incident_scenarios"))
+        _benchmark_jobs[job_id] = {"status": "running", "result": None, "created_at": time.time(),
+                                   "completed": 0, "total": total, "current_scenario": None}
+
+    def progress(completed: int, total_: int, scenario_id: Optional[str]) -> None:
+        _benchmark_jobs[job_id].update(completed=completed, total=total_, current_scenario=scenario_id)
+
+    def do_benchmark():
+        try:
+            from src.benchmark import run_benchmark
+            result = run_benchmark(
+                scenarios_dir="data/incident_scenarios",
+                include_unsafe_baseline=True,
+                audit_log_path="outputs/benchmark_audit_trail.jsonl",
+                report_dir="outputs/benchmark_reports",
+                progress_callback=progress,
+            )
+            _benchmark_jobs[job_id].update(status="done", result=result)
+        except Exception as e:
+            logger.exception("Benchmark %s failed", job_id)
+            _benchmark_jobs[job_id].update(status="error", result={"error": str(e)})
+
+    threading.Thread(target=do_benchmark, daemon=True, name=job_id).start()
+    return JSONResponse({"job_id": job_id, "status": "running"})
+
+
+@app.get("/api/benchmark/{job_id}")
+def get_benchmark_status(job_id: str):
+    """Poll a background benchmark job's status, progress and result."""
+    job = _benchmark_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, detail="Benchmark job not found.")
+    return JSONResponse({k: job.get(k) for k in ("status", "result", "completed", "total", "current_scenario")})
+
+
+# ── MITRE ATT&CK / OWASP Coverage, Exports, Certification ────────────────────
+
+def _compute_coverage() -> Dict[str, Any]:
+    from src.benchmark import discover_scenarios
+
+    tested_scenario_ids = {
+        e.get("details", {}).get("scenario_id")
+        for e in _load_all_audit_events() if e.get("event_type") == "SCENARIO_LOADED"
+    }
+    techniques: Dict[str, Dict[str, Any]] = {}
+    owasp: Dict[str, Dict[str, Any]] = {}
+    scenario_count = 0
+
+    for path in discover_scenarios("data/incident_scenarios"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        meta = data.get("scenario_metadata", {})
+        scenario_id = meta.get("scenario_id")
+        scenario_count += 1
+        ti = meta.get("threat_intelligence", {})
+
+        for tech in ti.get("mitre_attack", {}).get("techniques", []):
+            tid = tech.get("id")
+            if not tid:
+                continue
+            entry = techniques.setdefault(tid, {"id": tid, "name": tech.get("name", tid), "scenario_ids": [], "tested": False})
+            entry["scenario_ids"].append(scenario_id)
+            entry["tested"] = entry["tested"] or scenario_id in tested_scenario_ids
+
+        for risk in ti.get("owasp_llm_top10", []):
+            rid = risk.get("id")
+            if not rid:
+                continue
+            entry = owasp.setdefault(rid, {"id": rid, "name": risk.get("name", rid), "scenario_ids": []})
+            entry["scenario_ids"].append(scenario_id)
+
+    return {
+        "scenario_count": scenario_count,
+        "mitre_techniques": sorted(techniques.values(), key=lambda t: t["id"]),
+        "owasp_llm_risks": sorted(owasp.values(), key=lambda r: r["id"]),
+    }
+
+
+@app.get("/api/mitre-coverage")
+def get_mitre_coverage():
+    """Aggregate MITRE ATT&CK / OWASP LLM coverage across the scenario library, for a heatmap."""
+    return JSONResponse(_compute_coverage())
+
+
+def _csv_response(rows: List[List[Any]], filename: str) -> StreamingResponse:
+    import csv as csv_module
+    import io as io_module
+
+    buf = io_module.StringIO()
+    csv_module.writer(buf).writerows(rows)
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    return JSONResponse(results)
 
 
-@app.post("/api/approve/{run_id}")
-async def submit_approval(run_id: str, request: Request):
-    """Submit a human-in-the-loop approval decision."""
-    body = await request.json()
-    approved = body.get("approved", False)
-    action_id = body.get("action_id", "")
-    # In a full async implementation, this would signal the waiting run
-    return JSONResponse({"status": "received", "approved": approved, "action_id": action_id})
+@app.get("/api/audit/export.csv")
+def export_audit_csv(run_id: Optional[str] = None, event_type: Optional[str] = None):
+    """Download the audit trail as CSV — raw evidence judges can inspect outside the UI."""
+    events = _events_for_run(run_id) if run_id else _load_all_audit_events()
+    if event_type:
+        events = [e for e in events if e.get("event_type") == event_type]
+    rows: List[List[Any]] = [["event_id", "run_id", "timestamp", "event_type", "tool_name",
+                              "decision", "rule", "executed", "source_evidence_id", "reason"]]
+    for e in sorted(events, key=lambda e: e.get("timestamp", "")):
+        d = e.get("details", {})
+        rows.append([
+            e.get("event_id"), e.get("run_id"), e.get("timestamp"), e.get("event_type"),
+            d.get("tool_name", ""), d.get("decision", ""), d.get("rule", ""), d.get("executed", ""),
+            d.get("source_evidence_id", ""), str(d.get("reason", ""))[:300],
+        ])
+    return _csv_response(rows, f"audit_trail_{run_id or 'all'}.csv")
+
+
+@app.get("/api/benchmark/{job_id}/export.csv")
+def export_benchmark_csv(job_id: str):
+    """Download a completed benchmark job's per-scenario results as CSV."""
+    job = _benchmark_jobs.get(job_id)
+    if not job or job["status"] != "done" or not job.get("result"):
+        raise HTTPException(404, detail="Benchmark job not found or not yet complete.")
+    rows: List[List[Any]] = [["scenario_id", "scenario_name", "defended_passed", "defended_latency_s",
+                              "unsafe_breached", "unsafe_latency_s"]]
+    for s in job["result"].get("scenarios", []):
+        defended, unsafe = s.get("defended") or {}, s.get("unsafe_baseline") or {}
+        rows.append([s.get("scenario_id"), s.get("scenario_name"), defended.get("passed"),
+                     defended.get("triage_latency_s"), unsafe.get("breached"), unsafe.get("triage_latency_s")])
+    return _csv_response(rows, f"benchmark_{job_id}.csv")
+
+
+@app.get("/api/certification")
+def get_certification():
+    """Shareable 'trust certificate' for the latest benchmark. The certificate ID is a
+    hash of the benchmark results themselves, so it's stable and verifiable — the
+    same results always produce the same ID."""
+    import hashlib
+
+    summary_path = "outputs/benchmark_reports/benchmark_summary.json"
+    if not os.path.exists(summary_path):
+        raise HTTPException(404, detail="No benchmark has been run yet. Run a benchmark first (POST /api/benchmark).")
+    with open(summary_path, "r", encoding="utf-8") as f:
+        summary = json.load(f)
+
+    coverage = _compute_coverage()
+    canonical = json.dumps(
+        {k: summary.get(k) for k in ("total_scenarios", "defended_pass_rate", "unsafe_breach_rate", "scenarios")},
+        sort_keys=True, default=str,
+    )
+    issued_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(summary_path)))
+
+    return JSONResponse({
+        "certificate_id": hashlib.sha256(canonical.encode()).hexdigest()[:12].upper(),
+        "generated_at": issued_at,
+        "total_scenarios": summary.get("total_scenarios"),
+        "defended_pass_rate": summary.get("defended_pass_rate"),
+        "unsafe_breach_rate": summary.get("unsafe_breach_rate"),
+        "avg_triage_latency_s": summary.get("avg_triage_latency_s"),
+        "mitre_techniques_covered": len(coverage["mitre_techniques"]),
+        "owasp_llm_risks_covered": len(coverage["owasp_llm_risks"]),
+    })
+
+
+@app.get("/api/metrics/trend")
+def get_metrics_trend(limit: int = 50):
+    """Per-run threat-score/TCR/UAER trend across recent runs — the 'stays safe over time' proof point."""
+    from src.evaluation import Evaluator
+
+    by_run: Dict[str, List[Dict[str, Any]]] = {}
+    for e in _load_all_audit_events():
+        by_run.setdefault(e.get("run_id", "unknown"), []).append(e)
+
+    points = []
+    for run_id, run_events in by_run.items():
+        report_evt = next((e for e in run_events if e.get("event_type") == "REPORT_GENERATED"), None)
+        if not report_evt:
+            continue
+        scenario_evt = next((e for e in run_events if e.get("event_type") == "SCENARIO_LOADED"), None)
+        scenario = _resolve_scenario_for_run(run_id, run_events)
+        expected_outcome = scenario.get("incident", {}).get("expected_outcome") if scenario else None
+        metrics = Evaluator(run_id=run_id).evaluate_run(run_events, expected_outcome).metrics
+        points.append({
+            "run_id": run_id,
+            "timestamp": report_evt.get("timestamp"),
+            "scenario_id": (scenario_evt or {}).get("details", {}).get("scenario_id", "unknown"),
+            "threat_score": metrics.get("threat_score", 0.0),
+            "tcr": metrics.get("tcr_numeric", 0.0),
+            "uaer": metrics.get("uaer_numeric", 0.0),
+        })
+
+    points.sort(key=lambda p: p["timestamp"] or "")
+    return JSONResponse({"points": points[-limit:]})
+
+
+@app.post("/api/demo/reset")
+def reset_demo_state(confirm: bool = False):
+    """Clear generated run artifacts (dashboard/simulate/upload runs + in-memory state) for
+    a clean slate before a live demo. Never touches curated scenarios or sample CSVs."""
+    if not confirm:
+        raise HTTPException(400, detail="Pass ?confirm=true to actually reset demo state.")
+    if any(m.get("status") == "running" for m in _run_meta.values()) or \
+            any(j.get("status") == "running" for j in _benchmark_jobs.values()):
+        raise HTTPException(409, detail="A run or benchmark is still in progress — wait for it to finish.")
+
+    removed = 0
+    if os.path.isdir("outputs"):
+        for f in os.listdir("outputs"):
+            if f.startswith(("dashboard_", "simulate_")) and f.endswith((".jsonl", ".md")):
+                os.remove(os.path.join("outputs", f))
+                removed += 1
+    if os.path.isdir("outputs/uploads"):
+        for f in os.listdir("outputs/uploads"):
+            os.remove(os.path.join("outputs/uploads", f))
+            removed += 1
+
+    _channels.clear()
+    _run_meta.clear()
+    _pending_approvals.clear()
+    _benchmark_jobs.clear()
+    return JSONResponse({"status": "reset", "files_removed": removed})
 
 
 # ── AI Chatbot Routes (Gemini) ────────────────────────────────────────────────
@@ -1937,7 +1135,7 @@ async def chat_with_advisor(request: Request):
         from src.gemini_advisor import get_advisor
         body = await request.json()
         message = body.get("message", "").strip()
-        context = body.get("context")  # Optional session context dict
+        context = body.get("context")
 
         if not message:
             return JSONResponse({"response": "Please provide a message.", "success": False}, status_code=400)
@@ -2068,32 +1266,62 @@ async def poll_telegram_updates():
 @app.get("/api/integrations/status")
 async def integrations_status():
     """Return status of all external integrations."""
-    import os
     brevo_key = os.getenv("BREVO_API_KEY", "")
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     gemini_key = os.getenv("GEMINI_API_KEY", "")
 
-    from src.notifications import TELEGRAM_CHAT_IDS, ADMIN_EMAILS
+    from src.notifications import TELEGRAM_CHAT_IDS, ADMIN_EMAILS, channel_status
+    from src.gemini_advisor import get_advisor
+    disabled = channel_status()
     return JSONResponse({
         "brevo_email": {
-            "configured": bool(brevo_key and brevo_key != "your_brevo_api_key_here"),
+            "configured": bool(brevo_key and brevo_key != "your_brevo_api_key_here" and ADMIN_EMAILS),
             "admin_emails": ADMIN_EMAILS,
+            "disabled_reason": disabled["brevo"],
         },
         "telegram": {
-            "configured": bool(telegram_token and telegram_token != "your_telegram_bot_token_here"),
+            "configured": bool(telegram_token and telegram_token != "your_telegram_bot_token_here" and TELEGRAM_CHAT_IDS),
             "chat_ids_count": len(TELEGRAM_CHAT_IDS),
+            "disabled_reason": disabled["telegram"],
         },
         "gemini_ai": {
             "configured": bool(gemini_key and gemini_key != "your_gemini_api_key_here"),
-            "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            "model": get_advisor().model,
         },
     })
+
+
+# ── Landing / SPA (registered LAST so it never shadows /api/* or /docs) ─────
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Serve the built React SPA if present, else point at the API docs."""
+    index_path = os.path.join(_FRONTEND_DIST, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return JSONResponse({
+        "message": "Frontend build not found. Run `npm install && npm run build` in agentshield-arena/frontend, "
+                    "or run `npm run dev` there and open http://localhost:5173 instead.",
+        "api_docs": "/docs"
+    })
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa_fallback(full_path: str):
+    """Client-side routing fallback for the SPA build (e.g. /dashboard/graph on a hard refresh)."""
+    if full_path.startswith("api/"):
+        # Unknown API routes must 404 as JSON — not return index.html with a 200,
+        # which makes API clients fail with confusing JSON-parse errors.
+        raise HTTPException(404, detail=f"Unknown API endpoint: /{full_path}")
+    index_path = os.path.join(_FRONTEND_DIST, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(404, detail="Frontend build not found. See / for setup instructions.")
 
 
 if __name__ == "__main__":
     os.makedirs("outputs", exist_ok=True)
 
-    # Fire welcome notifications in a background thread
     def _send_welcome():
         try:
             from src.notifications import send_welcome_email, notify_welcome_telegram
@@ -2102,14 +1330,14 @@ if __name__ == "__main__":
         except Exception as exc:
             print(f"[Notifications] Startup notifications failed: {exc}")
 
-    import threading as _threading
-    _threading.Thread(target=_send_welcome, daemon=True).start()
+    threading.Thread(target=_send_welcome, daemon=True).start()
 
-    print("\n" + "="*60)
-    print(" AgentShield Arena — Interactive Security Dashboard")
-    print("="*60)
-    print(" Open your browser at: http://localhost:8000")
-    print(" API Documentation:    http://localhost:8000/docs")
-    print(" Integrations status:  http://localhost:8000/api/integrations/status")
-    print("="*60 + "\n")
+    print("\n" + "=" * 60)
+    print(" AgentShield Arena — JSON API Backend")
+    print("=" * 60)
+    print(" Frontend (built):      http://localhost:8000")
+    print(" Frontend (dev server): http://localhost:5173  (npm run dev in frontend/)")
+    print(" API Documentation:     http://localhost:8000/docs")
+    print(" Integrations status:   http://localhost:8000/api/integrations/status")
+    print("=" * 60 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

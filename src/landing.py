@@ -52,7 +52,7 @@ LANDING_HTML = r"""<!DOCTYPE html>
     #progress-bar { position:fixed; top:52px; left:0; height:2px; background:linear-gradient(90deg,#2997ff,#06b6d4); z-index:999; width:0%; box-shadow:0 0 8px #2997ff88; pointer-events:none; }
 
     /* HERO — scroller creates scroll distance; sticky child locks to viewport */
-    #hero-scroller { position:relative; height:700vh; }
+    #hero-scroller { position:relative; height:1000vh; }
     #hero-sticky { position:sticky; top:0; width:100%; height:100vh; overflow:hidden; }
     #hero-canvas-wrap { position:absolute; inset:0; background:#070a13; }
     #hero-canvas { display:block; width:100%; height:100%; object-fit:cover; }
@@ -167,7 +167,7 @@ LANDING_HTML = r"""<!DOCTYPE html>
 
 <div id="progress-bar"></div>
 
-<!-- HERO SCROLL SEQUENCE: scroller is tall (700vh) so there is lots of scroll distance.
+<!-- HERO SCROLL SEQUENCE: scroller is tall (1000vh) so there is lots of scroll distance.
      The inner sticky div locks to the viewport and shows the canvas. -->
 <div id="hero-scroller">
   <div id="hero-sticky">
