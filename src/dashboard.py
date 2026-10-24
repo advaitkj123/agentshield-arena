@@ -30,6 +30,12 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -1184,6 +1190,327 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     // Init
     loadAuditTrail();
+    initChatbot();
+  </script>
+
+  <!-- ── AI Security Advisor Chatbot ─────────────────────────────────── -->
+  <style>
+    #chatWidget {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 9999;
+      font-family: var(--font-sans);
+    }
+    #chatToggle {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #3b82f6, #06b6d4);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      box-shadow: 0 4px 24px rgba(59,130,246,0.5);
+      transition: transform 0.2s, box-shadow 0.2s;
+      margin-left: auto;
+    }
+    #chatToggle:hover { transform: scale(1.08); box-shadow: 0 6px 32px rgba(59,130,246,0.7); }
+    #chatPanel {
+      display: none;
+      flex-direction: column;
+      width: 380px;
+      height: 520px;
+      background: #111827;
+      border: 1px solid #243050;
+      border-radius: 16px;
+      overflow: hidden;
+      margin-bottom: 12px;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+      animation: slideUp 0.25s ease;
+    }
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    #chatPanel.open { display: flex; }
+    #chatHeader {
+      background: linear-gradient(135deg, #1e3a5f, #0d2137);
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid #243050;
+      flex-shrink: 0;
+    }
+    #chatHeader .chat-avatar {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, #3b82f6, #06b6d4);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+    }
+    #chatHeader .chat-title { font-size: 13px; font-weight: 600; color: #f9fafb; }
+    #chatHeader .chat-subtitle { font-size: 11px; color: #64748b; }
+    #chatHeader .clear-btn {
+      margin-left: auto;
+      background: none;
+      border: 1px solid #243050;
+      color: #64748b;
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    #chatHeader .clear-btn:hover { color: #ef4444; border-color: #ef4444; }
+    #chatMessages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    #chatMessages::-webkit-scrollbar { width: 4px; }
+    #chatMessages::-webkit-scrollbar-track { background: transparent; }
+    #chatMessages::-webkit-scrollbar-thumb { background: #243050; border-radius: 2px; }
+    .chat-msg {
+      display: flex;
+      flex-direction: column;
+      max-width: 88%;
+      animation: fadeIn 0.2s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .chat-msg.user { align-self: flex-end; align-items: flex-end; }
+    .chat-msg.ai   { align-self: flex-start; align-items: flex-start; }
+    .chat-bubble {
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .chat-msg.user .chat-bubble {
+      background: linear-gradient(135deg, #1d4ed8, #0369a1);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .chat-msg.ai .chat-bubble {
+      background: #1a2236;
+      color: #d1d5db;
+      border: 1px solid #243050;
+      border-bottom-left-radius: 4px;
+    }
+    .chat-msg .chat-time { font-size: 10px; color: #4b5563; margin-top: 3px; }
+    #chatInput {
+      display: flex;
+      gap: 8px;
+      padding: 12px;
+      border-top: 1px solid #243050;
+      background: #0d1117;
+      flex-shrink: 0;
+    }
+    #chatInputField {
+      flex: 1;
+      background: #1a2236;
+      border: 1px solid #243050;
+      border-radius: 8px;
+      color: #f9fafb;
+      font-size: 13px;
+      padding: 8px 12px;
+      outline: none;
+      resize: none;
+      font-family: var(--font-sans);
+      transition: border-color 0.2s;
+      max-height: 100px;
+    }
+    #chatInputField:focus { border-color: #3b82f6; }
+    #chatSendBtn {
+      background: linear-gradient(135deg, #3b82f6, #06b6d4);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 16px;
+      padding: 8px 14px;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    #chatSendBtn:hover { opacity: 0.85; }
+    #chatSendBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .chat-typing {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+      padding: 8px 12px;
+      background: #1a2236;
+      border: 1px solid #243050;
+      border-radius: 12px;
+      border-bottom-left-radius: 4px;
+      width: fit-content;
+    }
+    .chat-typing span {
+      width: 7px;
+      height: 7px;
+      background: #3b82f6;
+      border-radius: 50%;
+      animation: bounce 1.2s infinite;
+    }
+    .chat-typing span:nth-child(2) { animation-delay: 0.2s; }
+    .chat-typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce {
+      0%, 60%, 100% { transform: translateY(0); }
+      30% { transform: translateY(-6px); }
+    }
+    .chat-suggestions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 0 16px 12px;
+      flex-shrink: 0;
+    }
+    .chat-suggestions button {
+      background: #1a2236;
+      border: 1px solid #243050;
+      border-radius: 20px;
+      color: #64748b;
+      font-size: 11px;
+      padding: 5px 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .chat-suggestions button:hover { border-color: #3b82f6; color: #3b82f6; }
+  </style>
+
+  <div id="chatWidget">
+    <div id="chatPanel">
+      <div id="chatHeader">
+        <div class="chat-avatar">🤖</div>
+        <div>
+          <div class="chat-title">AI Security Advisor</div>
+          <div class="chat-subtitle">Powered by Google Gemini</div>
+        </div>
+        <button class="clear-btn" onclick="clearChat()">🗑 Clear</button>
+      </div>
+      <div id="chatMessages">
+        <div class="chat-msg ai">
+          <div class="chat-bubble">👋 Hi! I'm your AI Security Advisor powered by Gemini.\n\nI can help you:\n• Analyze incidents & triage steps\n• Explain Policy Gate decisions\n• Interpret DLP violations\n• Review evaluation metrics\n• Answer cybersecurity questions\n\nWhat would you like to know?</div>
+          <div class="chat-time">now</div>
+        </div>
+      </div>
+      <div class="chat-suggestions">
+        <button onclick="sendSuggestion('Explain the Policy Gate BLOCK decision')">Policy Block?</button>
+        <button onclick="sendSuggestion('What are the 7 evaluation metrics?')">Metrics</button>
+        <button onclick="sendSuggestion('What is DLP and how does it work here?')">DLP</button>
+        <button onclick="sendSuggestion('How does the HITL approval workflow work?')">HITL</button>
+      </div>
+      <div id="chatInput">
+        <textarea id="chatInputField" placeholder="Ask about incidents, policies, DLP..." rows="1"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}"
+          oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+        <button id="chatSendBtn" onclick="sendChatMessage()">➤</button>
+      </div>
+    </div>
+    <button id="chatToggle" onclick="toggleChat()" title="AI Security Advisor">🤖</button>
+  </div>
+
+  <script>
+    let chatOpen = false;
+    let chatTypingEl = null;
+
+    function initChatbot() {
+      // Auto-open hint after 3s on first visit
+      if (!sessionStorage.getItem('chatHinted')) {
+        setTimeout(() => {
+          sessionStorage.setItem('chatHinted', '1');
+        }, 3000);
+      }
+    }
+
+    function toggleChat() {
+      chatOpen = !chatOpen;
+      document.getElementById('chatPanel').classList.toggle('open', chatOpen);
+      if (chatOpen) {
+        document.getElementById('chatInputField').focus();
+        scrollChatToBottom();
+      }
+    }
+
+    function clearChat() {
+      document.getElementById('chatMessages').innerHTML = '';
+      fetch('/api/chat/reset', { method: 'POST' });
+    }
+
+    function scrollChatToBottom() {
+      const msgs = document.getElementById('chatMessages');
+      msgs.scrollTop = msgs.scrollHeight;
+    }
+
+    function addChatMessage(role, text) {
+      const msgs = document.getElementById('chatMessages');
+      // Remove typing indicator if present
+      if (chatTypingEl && msgs.contains(chatTypingEl)) {
+        msgs.removeChild(chatTypingEl);
+        chatTypingEl = null;
+      }
+      const div = document.createElement('div');
+      div.className = `chat-msg ${role}`;
+      const now = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+      div.innerHTML = `
+        <div class="chat-bubble">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>')}</div>
+        <div class="chat-time">${now}</div>
+      `;
+      msgs.appendChild(div);
+      scrollChatToBottom();
+    }
+
+    function showTyping() {
+      const msgs = document.getElementById('chatMessages');
+      const div = document.createElement('div');
+      div.className = 'chat-msg ai';
+      div.innerHTML = '<div class="chat-typing"><span></span><span></span><span></span></div>';
+      msgs.appendChild(div);
+      chatTypingEl = div;
+      scrollChatToBottom();
+    }
+
+    async function sendChatMessage() {
+      const input = document.getElementById('chatInputField');
+      const msg = input.value.trim();
+      if (!msg) return;
+      input.value = '';
+      input.style.height = 'auto';
+      document.getElementById('chatSendBtn').disabled = true;
+
+      addChatMessage('user', msg);
+      showTyping();
+
+      try {
+        const resp = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: msg })
+        });
+        const data = await resp.json();
+        addChatMessage('ai', data.response || 'Sorry, I could not generate a response.');
+      } catch (err) {
+        addChatMessage('ai', '⚠️ Connection error. Please try again.');
+      } finally {
+        document.getElementById('chatSendBtn').disabled = false;
+        input.focus();
+      }
+    }
+
+    function sendSuggestion(text) {
+      document.getElementById('chatInputField').value = text;
+      sendChatMessage();
+    }
   </script>
 </body>
 </html>"""
@@ -1360,12 +1687,188 @@ async def submit_approval(run_id: str, request: Request):
     return JSONResponse({"status": "received", "approved": approved, "action_id": action_id})
 
 
+# ── AI Chatbot Routes (Gemini) ────────────────────────────────────────────────
+
+@app.post("/api/chat")
+async def chat_with_advisor(request: Request):
+    """Chat with the Gemini AI Security Advisor."""
+    try:
+        from src.gemini_advisor import get_advisor
+        body = await request.json()
+        message = body.get("message", "").strip()
+        context = body.get("context")  # Optional session context dict
+
+        if not message:
+            return JSONResponse({"response": "Please provide a message.", "success": False}, status_code=400)
+
+        advisor = get_advisor()
+        result = advisor.chat(message, context=context)
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({
+            "response": f"AI Advisor error: {exc}",
+            "success": False,
+            "error": str(exc)
+        }, status_code=500)
+
+
+@app.post("/api/chat/reset")
+async def reset_chat_history():
+    """Reset the AI advisor conversation history."""
+    try:
+        from src.gemini_advisor import get_advisor
+        get_advisor().reset_history()
+        return JSONResponse({"status": "reset", "message": "Conversation history cleared."})
+    except Exception as exc:
+        return JSONResponse({"status": "error", "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/chat/analyze-incident")
+async def analyze_incident_ai(request: Request):
+    """AI-powered incident analysis."""
+    try:
+        from src.gemini_advisor import get_advisor
+        incident = await request.json()
+        advisor = get_advisor()
+        result = advisor.analyze_incident(incident)
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"response": str(exc), "success": False}, status_code=500)
+
+
+@app.get("/api/chat/status")
+async def chat_status():
+    """Return AI advisor availability status."""
+    try:
+        from src.gemini_advisor import get_advisor
+        advisor = get_advisor()
+        return JSONResponse({
+            "available": advisor.is_available,
+            "model": advisor.model,
+            "history_length": len(advisor._history),
+        })
+    except Exception as exc:
+        return JSONResponse({"available": False, "error": str(exc)})
+
+
+# ── Notification Routes ───────────────────────────────────────────────────────
+
+@app.post("/api/notify/test-email")
+async def test_email_notification(request: Request):
+    """Send a test email notification via Brevo."""
+    try:
+        from src.notifications import send_security_alert_email
+        body = await request.json()
+        to_emails = body.get("emails")
+        success = send_security_alert_email(
+            alert_type="Test Alert",
+            incident_id="TEST-001",
+            details="This is a test notification from AgentShield Arena dashboard.",
+            severity="info",
+            to_emails=to_emails,
+        )
+        return JSONResponse({"success": success, "message": "Email sent" if success else "Email failed — check BREVO_API_KEY"})
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/notify/test-telegram")
+async def test_telegram_notification():
+    """Send a test Telegram message."""
+    try:
+        from src.notifications import _broadcast_telegram
+        results = _broadcast_telegram(
+            "🛡️ <b>AgentShield Arena</b> — Test notification from your security dashboard! ✅"
+        )
+        success = any(results)
+        return JSONResponse({
+            "success": success,
+            "chats_reached": sum(1 for r in results if r),
+            "message": "Telegram message sent" if success else "Failed — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS"
+        })
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/notify/telegram/register")
+async def register_telegram_chat_api(request: Request):
+    """Register a new Telegram chat ID for alerts."""
+    try:
+        from src.notifications import register_telegram_chat, TELEGRAM_CHAT_IDS
+        body = await request.json()
+        chat_id = str(body.get("chat_id", "")).strip()
+        if not chat_id:
+            return JSONResponse({"success": False, "error": "chat_id required"}, status_code=400)
+        register_telegram_chat(chat_id)
+        return JSONResponse({"success": True, "registered": chat_id, "all_chats": TELEGRAM_CHAT_IDS})
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/notify/telegram/updates")
+async def poll_telegram_updates():
+    """Poll Telegram for bot updates (to discover new chat IDs via /start)."""
+    try:
+        from src.notifications import get_telegram_updates, register_telegram_chat
+        updates = get_telegram_updates()
+        new_chats = []
+        for update in updates:
+            msg = update.get("message", {})
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            text = msg.get("text", "")
+            if chat_id and text.startswith("/start"):
+                register_telegram_chat(chat_id)
+                new_chats.append(chat_id)
+        return JSONResponse({"updates": len(updates), "new_chats_registered": new_chats})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/integrations/status")
+async def integrations_status():
+    """Return status of all external integrations."""
+    import os
+    brevo_key = os.getenv("BREVO_API_KEY", "")
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+
+    from src.notifications import TELEGRAM_CHAT_IDS, ADMIN_EMAILS
+    return JSONResponse({
+        "brevo_email": {
+            "configured": bool(brevo_key and brevo_key != "your_brevo_api_key_here"),
+            "admin_emails": ADMIN_EMAILS,
+        },
+        "telegram": {
+            "configured": bool(telegram_token and telegram_token != "your_telegram_bot_token_here"),
+            "chat_ids_count": len(TELEGRAM_CHAT_IDS),
+        },
+        "gemini_ai": {
+            "configured": bool(gemini_key and gemini_key != "your_gemini_api_key_here"),
+            "model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        },
+    })
+
+
 if __name__ == "__main__":
     os.makedirs("outputs", exist_ok=True)
+
+    # Fire welcome notifications in a background thread
+    def _send_welcome():
+        try:
+            from src.notifications import send_welcome_email, notify_welcome_telegram
+            send_welcome_email()
+            notify_welcome_telegram()
+        except Exception as exc:
+            print(f"[Notifications] Startup notifications failed: {exc}")
+
+    import threading as _threading
+    _threading.Thread(target=_send_welcome, daemon=True).start()
+
     print("\n" + "="*60)
     print(" AgentShield Arena — Interactive Security Dashboard")
     print("="*60)
     print(" Open your browser at: http://localhost:8000")
     print(" API Documentation:    http://localhost:8000/docs")
+    print(" Integrations status:  http://localhost:8000/api/integrations/status")
     print("="*60 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

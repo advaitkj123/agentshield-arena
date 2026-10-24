@@ -1,11 +1,19 @@
+# ============================================================
+# AgentShield Arena — Runtime Dependencies
+# ============================================================
+
 # Core runtime — zero paid API dependencies
 pytest>=8.0.0
 python-dotenv>=1.0.0
 
-# Optional: Interactive Dashboard (S1 stretch goal)
-# fastapi>=0.111.0
-# uvicorn[standard]>=0.30.0
+# ── Interactive Dashboard ────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
 
-# Optional: Live LLM Integration (S3 stretch goal)
+# ── Notification Integrations ────────────────────────────────
+# Brevo email and Telegram use Python stdlib (urllib) — no extra packages needed.
+# Gemini AI also uses urllib — no extra packages needed.
+
+# ── Optional: Live LLM Integration ──────────────────────────
 # openai>=1.30.0
 # anthropic>=0.25.0

@@ -35,6 +35,9 @@ The central contribution is architectural: **separating non-deterministic LLM re
 | **Threat Score** | Continuous 0.0–1.0 risk score per run (weighted: UAER + DLP + FBR) | ✅ Implemented |
 | **Automated Benchmarker** | Runs all 6 scenarios, aggregates defended vs. unsafe metrics | ✅ Implemented |
 | **Interactive Dashboard** | FastAPI + SSE + Chart.js real-time monitoring UI | ✅ Implemented |
+| **🤖 Gemini AI Security Advisor** | Floating chatbot widget powered by Gemini 2.0 Flash — explains decisions, analyzes incidents, multi-turn context | ✅ **NEW** |
+| **📧 Brevo Email Alerts** | Automated transactional emails for policy blocks, DLP violations, HITL requests, benchmark summaries | ✅ **NEW** |
+| **📱 Telegram Bot Alerts** | Real-time push notifications to Telegram for every critical security event | ✅ **NEW** |
 | **67 Passing Tests** | Unit + integration + DLP + benchmark + advisory tests | ✅ **67/67** |
 | **GitHub Actions CI** | Automated test + DLP + gate verification on every push | ✅ Implemented |
 | **Zero External Dependencies** | Entire test suite runs offline with stdlib only | ✅ Implemented |
@@ -42,6 +45,16 @@ The central contribution is architectural: **separating non-deterministic LLM re
 | **Immutable Audit Trail** | Append-only JSONL with run ID isolation | ✅ Implemented |
 | **MITRE ATT&CK Mapping** | Every scenario mapped to specific ATT&CK technique IDs | ✅ Implemented |
 | **OWASP LLM Top 10** | Each attack scenario tagged to OWASP LLM Top 10 2025 risk | ✅ Implemented |
+
+### 🏆 Judging Criteria Alignment
+
+| Criterion | How AgentShield Arena Delivers |
+| :--- | :--- |
+| **Reusability** | Modular `src/` architecture — Policy Gate, DLP, notifications, AI advisor each independently importable; `.env`-driven config; usable as a library in any Python project |
+| **Governance & Responsibility** | Four-layer deterministic Policy Gate enforces governance outside LLM influence; HITL authorization for all high-risk actions; immutable JSONL audit trail; Brevo + Telegram alerting closes the governance loop |
+| **ROI / Business Value** | Sub-millisecond MTTD, automated 6-scenario benchmarking, 100% defended pass rate vs unsafe baseline; email/Telegram alerts reduce MTTR; Gemini chatbot reduces analyst time-on-task |
+| **MVP Readiness** | 67 passing tests, live dashboard, working notifications, installable via `pip install -r requirements.txt && python src/dashboard.py`; CI green on every commit |
+| **Originality & Innovation** | First framework to combine: deterministic security enforcement + adversarial evaluation + AI-powered advisory (Gemini) + real-time multi-channel notifications (Email + Telegram) + HITL in one OSS package |
 
 ---
 
