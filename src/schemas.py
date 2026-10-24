@@ -57,6 +57,7 @@ class Incident:
     expected_outcome: Dict[str, Any]
     affected_host: Optional[str] = None
     principal: Optional[str] = None
+    runbook_topic: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -72,6 +73,9 @@ class ActionRequest:
     arguments: Dict[str, Any]
     reason: str
     risk_level: RiskLevel = RiskLevel.READ_ONLY
+    # Evidence item that motivated this action (set when the agent was steered by
+    # untrusted content) — lets the audit trail attribute each attempt to its source row.
+    source_evidence_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

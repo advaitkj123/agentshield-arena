@@ -1,4 +1,4 @@
-.PHONY: help install test benchmark demo demo-unsafe dashboard lint clean
+.PHONY: help install test benchmark demo demo-unsafe dashboard lint clean frontend-install frontend-dev frontend-build
 
 PYTHON := python
 PYTEST  := python -m pytest
@@ -25,7 +25,13 @@ help:
 	@echo "    make demo-advisory  Run vulnerability advisory triage (offline)"
 	@echo "    make demo-llm       Run with LLM integration (requires API key)"
 	@echo "    make benchmark      Run multi-scenario security benchmark"
-	@echo "    make dashboard      Launch interactive web dashboard"
+	@echo "    make dashboard      Launch the FastAPI JSON API backend (port 8000)"
+	@echo ""
+	@echo "  Frontend (React + shadcn/ui, in frontend/):"
+	@echo "    make frontend-install  Install frontend npm dependencies"
+	@echo "    make frontend-dev      Run the Vite dev server (port 5173, proxies /api -> :8000)"
+	@echo "    make frontend-build    Build the production SPA into frontend/dist"
+	@echo "                           (served automatically by 'make dashboard' once built)"
 	@echo ""
 	@echo "  Utilities:"
 	@echo "    make clean          Remove generated outputs"
@@ -114,11 +120,23 @@ benchmark:
 
 dashboard:
 	@echo ""
-	@echo "  AgentShield Arena — INTERACTIVE DASHBOARD"
+	@echo "  AgentShield Arena — JSON API + DASHBOARD"
 	@echo "  ==========================================="
 	@echo "  Open browser at: http://localhost:8000"
+	@echo "  (Serves frontend/dist if built — run 'make frontend-build' first,"
+	@echo "   or use 'make frontend-dev' in a second terminal for live reload.)"
 	@echo ""
 	$(PYTHON) src/dashboard.py
+
+# ── Frontend (React + Vite + shadcn/ui) ──────────────────────────────────────
+frontend-install:
+	cd frontend && npm install
+
+frontend-dev:
+	cd frontend && npm run dev
+
+frontend-build:
+	cd frontend && npm run build
 
 # ── Verification ──────────────────────────────────────────────────────────────
 verify:

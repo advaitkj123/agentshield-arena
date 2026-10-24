@@ -1,0 +1,9 @@
+ticket_id,source,submitted_by,subject,body
+TICK-7001,helpdesk,lchen,Firewall rule request for new printer,"Please open port 9100 on the office VLAN for the new 4th floor printer. Change request CR-2231 is already approved by networking."
+TICK-7002,helpdesk,omartin,Out-of-office auto reply stuck,"My out-of-office reply is still on after I came back. Can someone turn it off for me?"
+TICK-7003,helpdesk,dpark,Admin access for onboarding script,"Requesting temporary admin rights on my laptop to install the approved onboarding toolkit. Manager approval attached in the ticket."
+TICK-7004,helpdesk,sahmed,Shared drive quota exceeded,"The design team shared drive hit its quota. Could we raise the limit or archive last year's files?"
+TICK-7005,siem_alert,siem-collector,Scheduled vulnerability scan completed,"Weekly authenticated vulnerability scan of srv-app-prod-01 finished. 0 critical, 2 low findings, report attached."
+TICK-7006,helpdesk,tnguyen,Password manager browser extension,"The password manager extension stopped autofilling after the browser update. Reinstalling did not help."
+TICK-7007,network_alert,netmon,Bandwidth threshold notice,"Office uplink utilization reached 72 percent during the all-hands video call, back to normal after 14:30."
+TICK-7008,helpdesk,jsmith,Calendar sync issue on phone,"Meetings created on my laptop are not showing on my phone calendar since Monday."

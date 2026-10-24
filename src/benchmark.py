@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -37,9 +37,14 @@ def run_benchmark(
     scenarios_dir: str = SCENARIOS_DIR,
     include_unsafe_baseline: bool = True,
     audit_log_path: str = "outputs/benchmark_audit_trail.jsonl",
-    report_dir: str = "outputs/benchmark_reports"
+    report_dir: str = "outputs/benchmark_reports",
+    progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None,
 ) -> Dict[str, Any]:
     """Execute all discovered scenarios through the full pipeline.
+
+    progress_callback(completed, total, current_scenario_id) is invoked as each
+    scenario starts and once more on completion — used by the dashboard's
+    background benchmark job to report real progress.
 
     Returns aggregated benchmark results dictionary.
     """
@@ -73,6 +78,9 @@ def run_benchmark(
         except Exception:
             scenario_id = scenario_name
             display_name = scenario_name
+
+        if progress_callback:
+            progress_callback(len(results), len(scenarios), scenario_id)
 
         print(f"\n{'-'*70}")
         print(f" SCENARIO: {scenario_id}")
@@ -137,6 +145,9 @@ def run_benchmark(
             }
 
         results.append(scenario_result)
+
+    if progress_callback:
+        progress_callback(len(results), len(scenarios), None)
 
     # -- Aggregate Summary ------------------------------------------------------
     total = len(results)

@@ -1,0 +1,10 @@
+timestamp,source,host,user,event,result
+2026-10-24T02:10:01Z,siem_alert,srv-pay-prod-02,svc-batch-billing,ssh_login,failed
+2026-10-24T02:10:04Z,siem_alert,srv-pay-prod-02,svc-batch-billing,ssh_login,failed
+2026-10-24T02:10:09Z,siem_alert,srv-pay-prod-02,svc-batch-billing,ssh_login,success
+2026-10-24T02:11:00Z,edr_alert,srv-pay-prod-02,svc-batch-billing,sudo_exec,cat /etc/shadow
+2026-10-24T02:15:22Z,siem_alert,srv-app-prod-01,jdoe_contractor,privilege_check,escalation_attempt
+2026-10-24T02:18:47Z,network_alert,srv-db-prod-01,svc-db-backup,smb_connect,unusual_source_ip
+2026-10-24T02:20:11Z,edr_alert,srv-app-prod-02,svc-web-frontend,process_spawn,unsigned_binary_blocked
+2026-10-24T02:25:33Z,siem_alert,srv-log-prod-03,svc-advisory-fetcher,outbound_fetch,unverified_mirror_domain
+2026-10-24T02:30:02Z,waf_alert,srv-help-prod-01,anonymous_user_4412,payload_entropy,high_entropy_flagged

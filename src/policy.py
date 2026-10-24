@@ -59,7 +59,9 @@ TOOL_POLICY_REGISTRY: Dict[str, Dict[str, Any]] = {
         "optional_args": [],
         "authorized_hosts": [
             "srv-pay-prod-02", "srv-app-prod-01", "srv-db-prod-01",
-            "srv-log-prod-03", "srv-help-prod-01", "srv-app-prod-02"
+            "srv-log-prod-03", "srv-help-prod-01", "srv-app-prod-02",
+            "plc-scada-ot-04", "k8s-cluster-ctrl-01", "srv-corp-gateway-07",
+            "srv-vendor-patch-05", "srv-dns-edge-06"
         ]
     },
     "read_advisory": {
@@ -79,7 +81,11 @@ TOOL_POLICY_REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 
 
-def validate_arguments(tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
+def validate_arguments(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    registry: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
     """Validate tool arguments for required fields, type safety, bounds, and reject unexpected keys.
 
     Returns (is_valid, error_message, policy_rule_id).
@@ -87,7 +93,7 @@ def validate_arguments(tool_name: str, arguments: Dict[str, Any]) -> Tuple[bool,
     if not isinstance(arguments, dict):
         return False, "Arguments must be a valid dictionary", "RULE-INVALID-ARGS"
 
-    config = TOOL_POLICY_REGISTRY.get(tool_name)
+    config = (registry if registry is not None else TOOL_POLICY_REGISTRY).get(tool_name)
     if not config:
         return False, f"Unknown tool '{tool_name}'", "RULE-PROHIBITED-TOOL"
 
@@ -159,9 +165,17 @@ class PolicyGate:
       Layer 4: Semantic DLP  — inspect permitted argument values for credential/exfil patterns.
     """
 
-    def __init__(self, strict_mode: bool = True, enable_dlp: bool = True):
+    def __init__(
+        self,
+        strict_mode: bool = True,
+        enable_dlp: bool = True,
+        registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         self.strict_mode = strict_mode
         self.enable_dlp = enable_dlp
+        # Per-gate registry so what-if simulations can evaluate a modified policy
+        # without mutating the global allowlist used by concurrent real runs.
+        self.registry: Dict[str, Dict[str, Any]] = registry if registry is not None else TOOL_POLICY_REGISTRY
         self.consumed_tokens: Set[str] = set()  # Replay-resistant token tracking
 
     def evaluate(
@@ -175,7 +189,7 @@ class PolicyGate:
         Accepts either an action-bound ApprovalToken or legacy boolean approval_granted.
         """
         # Rule 1: Tool Allowlist Check
-        if action.tool_name not in TOOL_POLICY_REGISTRY:
+        if action.tool_name not in self.registry:
             return PolicyDecision(
                 action_id=action.action_id,
                 decision=PolicyDecisionStatus.DENY,
@@ -183,10 +197,10 @@ class PolicyGate:
                 policy_rule_id="RULE-PROHIBITED-TOOL"
             )
 
-        policy_entry = TOOL_POLICY_REGISTRY[action.tool_name]
+        policy_entry = self.registry[action.tool_name]
 
         # Rule 2: Strict Argument Schema, Bounds, & Unknown Argument Rejection
-        is_valid, validation_err, rule_id = validate_arguments(action.tool_name, action.arguments)
+        is_valid, validation_err, rule_id = validate_arguments(action.tool_name, action.arguments, self.registry)
         if not is_valid:
             return PolicyDecision(
                 action_id=action.action_id,

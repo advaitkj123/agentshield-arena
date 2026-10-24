@@ -9,9 +9,10 @@ import argparse
 import json
 import os
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Ensure project root is in sys.path regardless of how main.py is invoked
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -36,9 +37,34 @@ from src.mock_tools import MockITEnvironment
 from src.evaluation import Evaluator
 from src.reporting import ReportGenerator
 from src.advisory_connector import GitHubAdvisoryConnector, normalize_github_advisory
+from src.notifications import notify_security_event
+
+# Argument keys that identify a resource an action acted on — duplicated onto
+# POLICY_DECISION / TOOL_EXECUTION audit details so graph-building and UI
+# consumers don't have to join back to the originating ACTION_PROPOSED event.
+_RESOURCE_ARG_KEYS = ("host", "package_name", "advisory_id", "topic", "incident_id")
 
 
-def parse_incident(incident_dict: Dict[str, Any]) -> Incident:
+def _resource_fields(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract resource-identifying fields from an action's arguments for audit enrichment."""
+    return {k: arguments[k] for k in _RESOURCE_ARG_KEYS if k in arguments}
+
+
+def _fire_notification_async(event_type: str, incident_id: str, details: Dict[str, Any], severity: str = "high") -> None:
+    """Dispatch Brevo/Telegram notifications on a background thread.
+
+    notify_security_event() makes blocking network calls (urllib, ~10s timeout);
+    firing it inline would stall the orchestration loop whenever alerting is
+    configured. Degrades silently if no integrations are configured.
+    """
+    threading.Thread(
+        target=notify_security_event,
+        args=(event_type, incident_id, details, severity),
+        daemon=True
+    ).start()
+
+
+def parse_incident(incident_dict: Dict[str, Any], runbook_topic: Optional[str] = None) -> Incident:
     """Parse raw dictionary into typed Incident entity."""
     evidence_items = []
     for ev in incident_dict.get("evidence", []):
@@ -59,7 +85,8 @@ def parse_incident(incident_dict: Dict[str, Any]) -> Incident:
         evidence=evidence_items,
         expected_outcome=incident_dict.get("expected_outcome", {}),
         affected_host=incident_dict.get("affected_host", "srv-pay-prod-02"),
-        principal=incident_dict.get("principal", "svc-batch-billing")
+        principal=incident_dict.get("principal", "svc-batch-billing"),
+        runbook_topic=runbook_topic
     )
 
 
@@ -69,22 +96,48 @@ def run_incident_orchestration(
     interactive_approval: bool = False,
     disable_policy_gate: bool = False,
     audit_log_path: str = "outputs/audit_trail.jsonl",
-    report_path: str = "outputs/incident_report.md"
+    report_path: str = "outputs/incident_report.md",
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    approval_provider: Optional[Callable[[ActionRequest], Optional[ApprovalToken]]] = None,
+    run_id: Optional[str] = None,
+    enable_dlp: bool = True,
+    scenario_data: Optional[Dict[str, Any]] = None,
+    policy_registry: Optional[Dict[str, Dict[str, Any]]] = None,
+    notify: bool = False,
 ) -> int:
-    """Execute end-to-end IT incident response scenario."""
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    """Execute end-to-end IT incident response scenario.
+
+    on_event: optional callback invoked synchronously with each audit event dict
+        the instant it's recorded — lets a caller (e.g. the dashboard) stream
+        events live instead of replaying the audit log after the run finishes.
+    approval_provider: optional callback invoked when a HIGH-risk action needs
+        HITL approval; must return an ApprovalToken (approved or not) or None,
+        and may block (e.g. waiting on an external /api/approve call). Takes
+        priority over interactive_approval/auto_approve when supplied.
+    run_id: optional caller-supplied run id (so a dashboard can pre-allocate
+        the id before the run starts, e.g. to open its SSE queue first).
+    scenario_data: optional pre-built scenario dict (same shape as a scenario
+        JSON file) — when supplied, scenario_path is skipped entirely. Used by
+        the dashboard's live CSV-upload analysis feature, where the scenario
+        is assembled in memory from an uploaded file rather than read from disk.
+    policy_registry: optional tool-registry override for this run's Policy Gate
+        (what-if simulation) — never mutates the global registry.
+    notify: send Brevo/Telegram alerts for blocks/DLP/HITL. Off by default so
+        tests, benchmarks and simulations stay offline; live runs opt in.
+    """
+    run_id = run_id or f"run-{uuid.uuid4().hex[:8]}"
     print(f"\n========================================================")
     print(f" AgentShield Arena: Adversarially Resilient AI Agents")
     print(f" Mode: IT INCIDENT TRIAGE")
     print(f" Run ID: {run_id} | Policy Enforced: {not disable_policy_gate}")
     print(f"========================================================\n")
 
-    if not os.path.exists(scenario_path):
-        print(f"[-] Error: Scenario file '{scenario_path}' does not exist.")
-        return 1
-
-    with open(scenario_path, "r", encoding="utf-8") as f:
-        scenario_data = json.load(f)
+    if scenario_data is None:
+        if not os.path.exists(scenario_path):
+            print(f"[-] Error: Scenario file '{scenario_path}' does not exist.")
+            return 1
+        with open(scenario_path, "r", encoding="utf-8") as f:
+            scenario_data = json.load(f)
 
     red_agent = RedAgent()
     campaign = red_agent.load_scenario(scenario_data)
@@ -93,12 +146,16 @@ def run_incident_orchestration(
     print(f"    - Target Injected Tool : {campaign['target_tool']}")
 
     incident_data = red_agent.inject_adversarial_payload(scenario_data.get("incident", {}))
-    incident = parse_incident(incident_data)
+    incident = parse_incident(incident_data, runbook_topic=scenario_data.get("mock_runbook", {}).get("topic"))
 
     mock_env = MockITEnvironment(scenario_fixture=scenario_data)
-    policy_gate = PolicyGate(strict_mode=True)
+    policy_gate = PolicyGate(strict_mode=True, enable_dlp=enable_dlp, registry=policy_registry)
     blue_agent = BlueAgent()
     evaluator = Evaluator(run_id=run_id)
+
+    def alert(event_type: str, details: Dict[str, Any], severity: str = "high") -> None:
+        if notify:
+            _fire_notification_async(event_type, incident.incident_id, details, severity)
 
     audit_events: List[Dict[str, Any]] = []
 
@@ -111,11 +168,16 @@ def run_incident_orchestration(
             scenario_id=incident.incident_id,
             timestamp=datetime.now(timezone.utc).isoformat()
         )
-        audit_events.append(evt.to_dict())
+        evt_dict = evt.to_dict()
+        audit_events.append(evt_dict)
+        if on_event:
+            on_event(evt_dict)
 
     record_audit("SCENARIO_LOADED", {
         "scenario_id": scenario_data.get("scenario_metadata", {}).get("scenario_id", "SCENARIO-01"),
         "incident_id": incident.incident_id,
+        "affected_host": incident.affected_host,
+        "principal": incident.principal,
         "adversarial_campaign": campaign
     })
 
@@ -124,7 +186,7 @@ def run_incident_orchestration(
     last_decision = None
     last_result = None
     step = 0
-    max_steps = 10
+    max_steps = 25  # read steps + up to 8 injected attempts + containment + ticket
 
     while step < max_steps:
         action = blue_agent.plan_next_action(
@@ -150,7 +212,8 @@ def run_incident_orchestration(
                 "tool_name": action.tool_name,
                 "executed": exec_res.executed,
                 "status": exec_res.status,
-                "summary": exec_res.result_summary
+                "summary": exec_res.result_summary,
+                **_resource_fields(action.arguments)
             })
             last_decision = None
             last_result = exec_res
@@ -162,24 +225,38 @@ def run_incident_orchestration(
 
         approval_token: Optional[ApprovalToken] = None
         if decision.decision == PolicyDecisionStatus.APPROVAL_REQUIRED:
-            approval_granted = False
-            if interactive_approval:
-                user_choice = input(f"  [?] Operator Approval Required for '{action.tool_name}'. Approve? (y/N): ").strip().lower()
-                approval_granted = (user_choice == "y")
-            else:
-                approval_granted = auto_approve
+            alert("hitl_request", {
+                "tool_name": action.tool_name,
+                "action_id": action.action_id,
+                "run_id": run_id,
+                "arguments": action.arguments
+            })
 
-            if approval_granted:
-                approval_token = ApprovalToken(
-                    token_id=f"tok-{uuid.uuid4().hex[:6]}",
-                    action_id=action.action_id,
-                    tool_name=action.tool_name,
-                    approver_id="human_analyst",
-                    approved=True
-                )
-                print(f"  [+] Human Operator Authorization Confirmed (Token: {approval_token.token_id}).")
+            if approval_provider is not None:
+                approval_token = approval_provider(action)
+                if approval_token and approval_token.approved:
+                    print(f"  [+] Human Operator Authorization Confirmed (Token: {approval_token.token_id}).")
+                else:
+                    print(f"  [-] Human Operator Authorization Denied or Timed Out (Fails Closed).")
             else:
-                print(f"  [-] Human Operator Authorization Denied (Fails Closed).")
+                approval_granted = False
+                if interactive_approval:
+                    user_choice = input(f"  [?] Operator Approval Required for '{action.tool_name}'. Approve? (y/N): ").strip().lower()
+                    approval_granted = (user_choice == "y")
+                else:
+                    approval_granted = auto_approve
+
+                if approval_granted:
+                    approval_token = ApprovalToken(
+                        token_id=f"tok-{uuid.uuid4().hex[:6]}",
+                        action_id=action.action_id,
+                        tool_name=action.tool_name,
+                        approver_id="human_analyst",
+                        approved=True
+                    )
+                    print(f"  [+] Human Operator Authorization Confirmed (Token: {approval_token.token_id}).")
+                else:
+                    print(f"  [-] Human Operator Authorization Denied (Fails Closed).")
 
         decision, exec_res, dlp_result = policy_gate.evaluate_and_dispatch(
             action=action,
@@ -193,8 +270,17 @@ def run_incident_orchestration(
             "decision": decision.decision.value,
             "rule": decision.policy_rule_id,
             "reason": decision.reason,
-            "human_approval_token": approval_token.token_id if approval_token else None
+            "human_approval_token": approval_token.token_id if approval_token else None,
+            **_resource_fields(action.arguments)
         })
+
+        if decision.decision == PolicyDecisionStatus.DENY:
+            alert("policy_block", {
+                "tool_name": action.tool_name,
+                "action_id": action.action_id,
+                "reason": decision.reason,
+                "run_id": run_id
+            }, severity=incident.severity.value)
 
         if dlp_result and dlp_result.violations:
             record_audit("DLP_INSPECTION", {
@@ -202,8 +288,15 @@ def run_incident_orchestration(
                 "tool_name": action.tool_name,
                 "blocked": dlp_result.blocked,
                 "violations": [v.to_dict() for v in dlp_result.violations],
-                "summary": dlp_result.inspection_summary
+                "summary": dlp_result.inspection_summary,
+                **_resource_fields(action.arguments)
             })
+            if dlp_result.blocked:
+                alert("dlp_violation", {
+                    "tool_name": action.tool_name,
+                    "pattern_ids": [v.pattern_id for v in dlp_result.violations if v.severity == "BLOCK"],
+                    "run_id": run_id
+                }, severity=incident.severity.value)
 
         record_audit("TOOL_EXECUTION", {
             "action_id": action.action_id,
@@ -211,7 +304,8 @@ def run_incident_orchestration(
             "executed": exec_res.executed,
             "status": exec_res.status,
             "summary": exec_res.result_summary,
-            "error": exec_res.error
+            "error": exec_res.error,
+            **_resource_fields(action.arguments)
         })
 
         if exec_res.executed:
@@ -222,6 +316,12 @@ def run_incident_orchestration(
         last_decision = decision
         last_result = exec_res
         step += 1
+
+    record_audit("SANDBOX_STATE_SNAPSHOT", {
+        "hosts": mock_env.hosts,
+        "tickets": mock_env.tickets,
+        "inventory": mock_env.inventory
+    })
 
     print(f"\n[*] Generating Final Incident Report & Evaluation Metrics...")
     incident_summary = blue_agent.generate_incident_report(incident)
@@ -247,10 +347,13 @@ def run_advisory_orchestration(
     scenario_path: Optional[str] = None,
     disable_policy_gate: bool = False,
     audit_log_path: str = "outputs/audit_trail.jsonl",
-    report_path: str = "outputs/incident_report.md"
+    report_path: str = "outputs/incident_report.md",
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    run_id: Optional[str] = None,
+    notify: bool = False,
 ) -> int:
     """Execute Vulnerability Advisory Triage workflow using genuine GitHub advisories."""
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    run_id = run_id or f"run-{uuid.uuid4().hex[:8]}"
     print(f"\n========================================================")
     print(f" AgentShield Arena: Adversarially Resilient AI Agents")
     print(f" Mode: VULNERABILITY ADVISORY TRIAGE (External Data)")
@@ -319,7 +422,10 @@ def run_advisory_orchestration(
             advisory_id=advisory.ghsa_id,
             timestamp=datetime.now(timezone.utc).isoformat()
         )
-        audit_events.append(evt.to_dict())
+        evt_dict = evt.to_dict()
+        audit_events.append(evt_dict)
+        if on_event:
+            on_event(evt_dict)
 
     record_audit("SCENARIO_LOADED", {
         "advisory_id": advisory.ghsa_id,
@@ -364,7 +470,8 @@ def run_advisory_orchestration(
                 "tool_name": action.tool_name,
                 "executed": exec_res.executed,
                 "status": exec_res.status,
-                "summary": exec_res.result_summary
+                "summary": exec_res.result_summary,
+                **_resource_fields(action.arguments)
             })
             last_decision = None
             last_result = exec_res
@@ -385,8 +492,17 @@ def run_advisory_orchestration(
             "tool_name": action.tool_name,
             "decision": decision.decision.value,
             "rule": decision.policy_rule_id,
-            "reason": decision.reason
+            "reason": decision.reason,
+            **_resource_fields(action.arguments)
         })
+
+        if notify and decision.decision == PolicyDecisionStatus.DENY:
+            _fire_notification_async("policy_block", advisory.ghsa_id, {
+                "tool_name": action.tool_name,
+                "action_id": action.action_id,
+                "reason": decision.reason,
+                "run_id": run_id
+            }, severity=advisory.severity)
 
         if dlp_result and dlp_result.violations:
             record_audit("DLP_INSPECTION", {
@@ -394,8 +510,15 @@ def run_advisory_orchestration(
                 "tool_name": action.tool_name,
                 "blocked": dlp_result.blocked,
                 "violations": [v.to_dict() for v in dlp_result.violations],
-                "summary": dlp_result.inspection_summary
+                "summary": dlp_result.inspection_summary,
+                **_resource_fields(action.arguments)
             })
+            if notify and dlp_result.blocked:
+                _fire_notification_async("dlp_violation", advisory.ghsa_id, {
+                    "tool_name": action.tool_name,
+                    "pattern_ids": [v.pattern_id for v in dlp_result.violations if v.severity == "BLOCK"],
+                    "run_id": run_id
+                }, severity=advisory.severity)
 
         record_audit("TOOL_EXECUTION", {
             "action_id": action.action_id,
@@ -403,7 +526,8 @@ def run_advisory_orchestration(
             "executed": exec_res.executed,
             "status": exec_res.status,
             "summary": exec_res.result_summary,
-            "error": exec_res.error
+            "error": exec_res.error,
+            **_resource_fields(action.arguments)
         })
 
         if exec_res.executed:
@@ -420,6 +544,12 @@ def run_advisory_orchestration(
         last_decision = decision
         last_result = exec_res
         step += 1
+
+    record_audit("SANDBOX_STATE_SNAPSHOT", {
+        "hosts": mock_env.hosts,
+        "tickets": mock_env.tickets,
+        "inventory": mock_env.inventory
+    })
 
     print(f"\n[*] Generating Vulnerability Triage Dossier & Evaluation Metrics...")
     vuln_report = blue_agent.generate_vulnerability_report(
@@ -481,6 +611,7 @@ def main():
     parser.add_argument("--report", default="outputs/incident_report.md", help="Output report path")
     parser.add_argument("--llm", action="store_true", help="Use LLM-backed Blue Agent (auto-detects OPENAI/ANTHROPIC/GEMINI API key)")
     parser.add_argument("--llm-provider", choices=["openai", "anthropic", "gemini", "deterministic"], default=None, help="Force specific LLM provider")
+    parser.add_argument("--notify", action="store_true", help="Send Brevo/Telegram alerts for blocks, DLP hits and HITL requests")
 
     args = parser.parse_args()
 
@@ -493,7 +624,8 @@ def main():
             scenario_path=scenario_path,
             disable_policy_gate=args.disable_policy_gate,
             audit_log_path=args.audit_log,
-            report_path=args.report
+            report_path=args.report,
+            notify=args.notify
         )
     else:
         auto_approve = not args.no_auto_approve
@@ -503,7 +635,8 @@ def main():
             interactive_approval=args.interactive_approval,
             disable_policy_gate=args.disable_policy_gate,
             audit_log_path=args.audit_log,
-            report_path=args.report
+            report_path=args.report,
+            notify=args.notify
         )
 
     sys.exit(exit_code)

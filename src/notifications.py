@@ -42,6 +42,22 @@ TELEGRAM_CHAT_IDS: List[str] = [c.strip() for c in _tg_chats_raw.split(",") if c
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Circuit breakers: once a provider rejects our credentials, stop calling it for
+# the rest of the process instead of re-failing (and re-logging) on every event.
+_disabled_channels: Dict[str, str] = {}
+
+
+def _trip_on_auth_failure(channel: str, exc: Exception) -> None:
+    code = getattr(exc, "code", None)
+    if code in (401, 403, 404):
+        _disabled_channels[channel] = f"HTTP {code} — credentials rejected; alerts disabled until restart"
+        logger.error("[Notifications] %s disabled: %s", channel, _disabled_channels[channel])
+
+
+def channel_status() -> Dict[str, Optional[str]]:
+    """Reason each channel is disabled, or None if healthy — surfaced by /api/integrations/status."""
+    return {"brevo": _disabled_channels.get("brevo"), "telegram": _disabled_channels.get("telegram")}
+
 
 # ── Brevo Email ──────────────────────────────────────────────────────────────
 
@@ -57,6 +73,8 @@ def _send_brevo_email(
     """
     if not BREVO_API_KEY or not to_emails:
         logger.warning("[Notifications] Brevo API key or recipients not configured — skipping email.")
+        return False
+    if "brevo" in _disabled_channels:
         return False
 
     try:
@@ -88,6 +106,7 @@ def _send_brevo_email(
 
     except Exception as exc:  # noqa: BLE001
         logger.error("[Notifications] Brevo email failed: %s", exc)
+        _trip_on_auth_failure("brevo", exc)
         return False
 
 
@@ -259,6 +278,8 @@ def _send_telegram_message(chat_id: str, text: str, parse_mode: str = "HTML") ->
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("[Notifications] Telegram bot token not configured — skipping.")
         return False
+    if "telegram" in _disabled_channels:
+        return False
 
     try:
         import urllib.request
@@ -289,6 +310,7 @@ def _send_telegram_message(chat_id: str, text: str, parse_mode: str = "HTML") ->
 
     except Exception as exc:  # noqa: BLE001
         logger.error("[Notifications] Telegram send failed to %s: %s", chat_id, exc)
+        _trip_on_auth_failure("telegram", exc)
         return False
 
 

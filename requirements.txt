@@ -9,6 +9,12 @@ python-dotenv>=1.0.0
 # ── Interactive Dashboard ────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9  # required by FastAPI for the CSV upload endpoint
+
+# ── Graph Risk-Propagation Scoring ──────────────────────────
+# Lightweight — NOT torch/torch-geometric. Pure numpy GraphSAGE-style
+# message passing in src/graph_risk.py, keeps the zero-heavy-dependency story.
+numpy>=1.26.0
 
 # ── Notification Integrations ────────────────────────────────
 # Brevo email and Telegram use Python stdlib (urllib) — no extra packages needed.
