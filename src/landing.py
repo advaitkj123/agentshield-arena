@@ -24,7 +24,8 @@ LANDING_HTML = r"""<!DOCTYPE html>
       --green: #30d158;
       --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
-    html { scroll-behavior: smooth; }
+    /* CRITICAL: Do NOT use scroll-behavior:smooth — it breaks canvas scrubber offset math */
+    html { scroll-behavior: auto; }
     body { background:#000; color:#f5f5f7; font-family:var(--font); overflow-x:hidden; -webkit-font-smoothing:antialiased; }
 
     /* NAV */
@@ -50,13 +51,13 @@ LANDING_HTML = r"""<!DOCTYPE html>
     /* PROGRESS */
     #progress-bar { position:fixed; top:52px; left:0; height:2px; background:linear-gradient(90deg,#2997ff,#06b6d4); z-index:999; width:0%; box-shadow:0 0 8px #2997ff88; pointer-events:none; }
 
-    /* HERO */
-    #hero-scroller { position:relative; height:800vh; }
-    #hero-sticky { position:sticky; top:0; height:100vh; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; }
-    #hero-canvas-wrap { position:absolute; inset:0; }
-    #hero-canvas { width:100%; height:100%; display:block; }
-    #hero-gradient { position:absolute; inset:0; background:linear-gradient(to bottom,rgba(0,0,0,0.1) 0%,rgba(0,0,0,0) 30%,rgba(0,0,0,0) 55%,rgba(0,0,0,0.9) 100%); pointer-events:none; }
-    #hero-text-wrap { position:relative; z-index:10; text-align:center; padding:0 24px 90px; width:100%; max-width:900px; margin:0 auto; }
+    /* HERO — scroller creates scroll distance; sticky child locks to viewport */
+    #hero-scroller { position:relative; height:700vh; }
+    #hero-sticky { position:sticky; top:0; width:100%; height:100vh; overflow:hidden; }
+    #hero-canvas-wrap { position:absolute; inset:0; background:#070a13; }
+    #hero-canvas { display:block; width:100%; height:100%; object-fit:cover; }
+    #hero-gradient { position:absolute; inset:0; background:linear-gradient(to bottom,rgba(0,0,0,0.25) 0%,rgba(0,0,0,0) 25%,rgba(0,0,0,0) 50%,rgba(0,0,0,0.85) 100%); pointer-events:none; }
+    #hero-text-wrap { position:absolute; bottom:90px; left:50%; transform:translateX(-50%); z-index:10; text-align:center; padding:0 24px; width:100%; max-width:900px; }
     .hero-badge { display:inline-flex; align-items:center; gap:8px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:980px; padding:6px 14px 6px 10px; font-size:12px; color:rgba(255,255,255,0.7); margin-bottom:20px; backdrop-filter:blur(10px); }
     .hero-badge .dot { width:6px; height:6px; background:#30d158; border-radius:50%; animation:pulse 2s infinite; }
     @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(48,209,88,0.5)}50%{box-shadow:0 0 0 5px rgba(48,209,88,0)} }
@@ -152,21 +153,22 @@ LANDING_HTML = r"""<!DOCTYPE html>
 
 <nav>
   <a class="nav-logo" href="/">
-    <div class="shield">🛡️</div>
+    <div class="shield">&#x1F6E1;&#xFE0F;</div>
     <span>AgentShield Arena</span>
   </a>
   <ul class="nav-links">
     <li><a href="#features">Features</a></li>
     <li><a href="#howitworks">Architecture</a></li>
     <li><a href="/docs">API</a></li>
-    <li><a href="https://github.com/advaitkj123/agentshield-arena" target="_blank">GitHub ↗</a></li>
+    <li><a href="https://github.com/advaitkj123/agentshield-arena" target="_blank">GitHub &#x2197;</a></li>
   </ul>
-  <a href="/dashboard" class="nav-cta">Open Dashboard →</a>
+  <a href="/dashboard" class="nav-cta">Open Dashboard &rarr;</a>
 </nav>
 
 <div id="progress-bar"></div>
 
-<!-- HERO SCROLL SEQUENCE -->
+<!-- HERO SCROLL SEQUENCE: scroller is tall (700vh) so there is lots of scroll distance.
+     The inner sticky div locks to the viewport and shows the canvas. -->
 <div id="hero-scroller">
   <div id="hero-sticky">
     <div id="hero-canvas-wrap">
@@ -176,13 +178,13 @@ LANDING_HTML = r"""<!DOCTYPE html>
     <div id="hero-text-wrap">
       <div class="hero-badge">
         <div class="dot"></div>
-        Adversarially Resilient AI · Live
+        Adversarially Resilient AI &middot; Live
       </div>
       <h1 id="hero-title">Defend Every<br/>AI Decision.</h1>
-      <p id="hero-subtitle">The world's first framework that pits real adversarial AI attacks against a deterministic four-layer Policy Gate — and proves your agents are safe every time.</p>
+      <p id="hero-subtitle">The world&apos;s first framework that pits real adversarial AI attacks against a deterministic four-layer Policy Gate &mdash; and proves your agents are safe every time.</p>
       <div class="hero-btns">
-        <a href="/dashboard" class="btn-primary">Enter Dashboard →</a>
-        <a href="#features" class="btn-secondary">See Features</a>
+        <a href="/dashboard" class="btn-primary">Enter Dashboard &rarr;</a>
+        <a href="#features" class="btn-secondary scroll-to">See Features</a>
       </div>
     </div>
     <div class="scroll-hint" id="scroll-hint">
@@ -199,116 +201,115 @@ LANDING_HTML = r"""<!DOCTYPE html>
 </div>
 
 <!-- STATS -->
-<div style="background:#000;padding:0 24px;">
-  <div class="stats-row fu">
+<div style="background:#000;padding:0 24px 60px;">
+  <div class="stats-row">
+    <div class="stat-cell">
+      <span class="stat-num" data-target="0">0</span>
+      <span class="stat-lbl">Unauthorized Actions Executed (UAER)</span>
+    </div>
     <div class="stat-cell">
       <span class="stat-num" data-target="100">0</span>
-      <span class="stat-lbl">Defended Pass Rate %</span>
+      <span class="stat-lbl">Task Completion Rate (%)</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-num" data-target="6">0</span>
+      <span class="stat-lbl">MITRE ATT&amp;CK Scenarios</span>
     </div>
     <div class="stat-cell">
       <span class="stat-num" data-target="67">0</span>
       <span class="stat-lbl">Tests Passing</span>
-    </div>
-    <div class="stat-cell">
-      <span class="stat-num" data-target="6">0</span>
-      <span class="stat-lbl">Attack Scenarios</span>
-    </div>
-    <div class="stat-cell">
-      <span class="stat-num">&lt;1ms</span>
-      <span class="stat-lbl">Mean Time to Defend</span>
     </div>
   </div>
 </div>
 
 <!-- FEATURES -->
 <div id="features">
-  <div class="sec-label fu">Capabilities</div>
-  <div class="sec-heading fu fd1">Everything you need to trust your AI agents.</div>
+  <div class="sec-label fu">Core Capabilities</div>
+  <h2 class="sec-heading fu">Built for adversarial reality.</h2>
   <div class="feat-grid">
+    <div class="feat-card fu" onmousemove="cardGlow(event,this)">
+      <div class="feat-icon">&#x1F6E1;&#xFE0F;</div>
+      <h3>4-Layer Policy Gate</h3>
+      <p>Deterministic allowlist &rarr; parameter boundary &rarr; cryptographic HITL tokenization &rarr; semantic DLP. Every agent action passes all four or is blocked.</p>
+      <span class="feat-tag">Zero Trust</span>
+    </div>
+    <div class="feat-card fu fd1" onmousemove="cardGlow(event,this)">
+      <div class="feat-icon">&#x1F4A5;</div>
+      <h3>Red Agent Attack Harness</h3>
+      <p>Six production-grade Indirect Prompt Injection scenarios mapped to MITRE ATT&amp;CK, injected into real incident logs and support tickets.</p>
+      <span class="feat-tag">MITRE ATT&amp;CK</span>
+    </div>
+    <div class="feat-card fu fd2" onmousemove="cardGlow(event,this)">
+      <div class="feat-icon">&#x1F9E0;</div>
+      <h3>Gemini 2.5 Flash Advisor</h3>
+      <p>Embedded AI Security Advisor with multi-turn memory, session context injection, and specialized training on policy gate decisions and DLP analysis.</p>
+      <span class="feat-tag blue">AI-Powered</span>
+    </div>
+    <div class="feat-card fu" onmousemove="cardGlow(event,this)">
+      <div class="feat-icon">&#x1F50D;</div>
+      <h3>13-Pattern DLP Engine</h3>
+      <p>In-flight inspection of all agent outputs for AWS keys, SSH keys, JWTs, database URIs, and Shannon entropy-based secret detection (H&ge;4.5 bits).</p>
+      <span class="feat-tag">Compliance</span>
+    </div>
+    <div class="feat-card fu fd1" onmousemove="cardGlow(event,this)">
+      <div class="feat-icon">&#x1F9D1;&#x200D;&#x2696;&#xFE0F;</div>
+      <h3>Cryptographic HITL</h3>
+      <p>High-risk actions require HMAC-SHA256 dual-key operator tokens. Alerts dispatched via Telegram and Brevo Email. Replay attacks are mathematically impossible.</p>
+      <span class="feat-tag">Human Oversight</span>
+    </div>
+    <div class="feat-card fu fd2" onmousemove="cardGlow(event,this)">
+      <div class="feat-icon">&#x1F4CA;</div>
+      <h3>7-Metric Evaluation Suite</h3>
+      <p>TCR, UAER, ASR, FBR, ACR, MTTD, and Composite Threat Score with mathematical formulations and multi-scenario benchmarking.</p>
+      <span class="feat-tag blue">Research-Grade</span>
+    </div>
     <div class="feat-card span2 fu" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">🛡️</div>
-      <h3>Four-Layer Policy Gate</h3>
-      <p>Every tool call passes through four independent enforcement layers — tool allowlist, argument schema validation, Human-in-the-Loop approval, and Semantic DLP inspection — all deterministic code, completely outside LLM influence. Security guarantees don't rely on model compliance.</p>
-      <span class="feat-tag blue">Core Architecture</span>
+      <div class="feat-icon">&#x26A1;</div>
+      <h3>Real-Time Multi-Channel Alerting</h3>
+      <p>Server-Sent Events stream every policy decision to the live SOC dashboard. Critical alerts dispatched instantly to Telegram Bot and Brevo transactional email with styled HTML dossiers. Zero polling overhead.</p>
+      <span class="feat-tag blue">Enterprise-Ready</span>
     </div>
     <div class="feat-card fu fd1" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">🤖</div>
-      <h3>Gemini AI Advisor</h3>
-      <p>Floating chatbot powered by Gemini 2.0 Flash. Explains every policy decision, analyzes incidents in real-time, and answers cybersecurity questions with full session context.</p>
-      <span class="feat-tag">New</span>
-    </div>
-    <div class="feat-card fu" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">🔍</div>
-      <h3>Semantic DLP Inspector</h3>
-      <p>13 regex patterns detect credentials, AWS keys, shadow file paths, and exfiltration attempts inside permitted tool arguments — stopping what a firewall can't.</p>
-    </div>
-    <div class="feat-card fu fd1" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">⚔️</div>
-      <h3>6 Adversarial Scenarios</h3>
-      <p>MITRE ATT&amp;CK + OWASP LLM Top 10 mapped attacks. Indirect prompt injection, credential exfil, privilege escalation — all benchmarked automatically.</p>
-    </div>
-    <div class="feat-card fu fd2" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">📧</div>
-      <h3>Email &amp; Telegram Alerts</h3>
-      <p>Brevo transactional emails + Telegram push for every policy block, DLP violation, HITL request, and benchmark completion. Real governance, real-time.</p>
-      <span class="feat-tag">New</span>
-    </div>
-    <div class="feat-card fu" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">🧑‍⚖️</div>
-      <h3>Human-in-the-Loop</h3>
-      <p>High-risk actions pause and require explicit operator approval — with email + Telegram prompts — before the sandbox ever executes them.</p>
-    </div>
-    <div class="feat-card fu fd1" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">📊</div>
-      <h3>7 Evaluation Metrics</h3>
-      <p>TCR, UAER, ASR, FBR, ACR, MTTD, and Threat Score — composited into a live radar chart and benchmarked against the unsafe baseline.</p>
-    </div>
-    <div class="feat-card fu fd2" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">📺</div>
-      <h3>Live Streaming Dashboard</h3>
-      <p>FastAPI + Server-Sent Events stream every policy decision directly into the browser. Radar charts, audit trail browser, benchmark comparisons — all real-time dark-mode UI.</p>
-      <span class="feat-tag blue">Open Source</span>
-    </div>
-    <div class="feat-card fu" onmousemove="cardGlow(event,this)">
-      <div class="feat-icon">🔐</div>
-      <h3>Immutable Audit Trail</h3>
-      <p>Append-only JSONL with run ID isolation. Every action, decision, and violation is permanently logged and queryable from the dashboard.</p>
+      <div class="feat-icon">&#x1F4CB;</div>
+      <h3>Immutable Audit Ledger</h3>
+      <p>Append-only JSONL log with monotonic UTC timestamps for every state transition. SOC2, FedRAMP, and PCI-DSS compliant audit trail consumable by Splunk and Elastic.</p>
+      <span class="feat-tag">Compliance</span>
     </div>
   </div>
 </div>
 
 <!-- HOW IT WORKS -->
 <div id="howitworks">
-  <div class="sec-label fu" style="text-align:center;">Architecture</div>
-  <div class="sec-heading fu fd1" style="text-align:center;">From attack to audit in milliseconds.</div>
+  <div class="sec-label fu">System Architecture</div>
+  <h2 class="sec-heading fu">How the defense works.</h2>
   <div class="pipeline">
     <div class="pipe-step fu">
-      <div class="pipe-icon">☠️</div>
-      <div class="pipe-lbl">Red Agent</div>
-      <div class="pipe-desc">Injects adversarial payloads into incident data</div>
+      <div class="pipe-icon">&#x1F6A8;</div>
+      <div class="pipe-lbl">Incident</div>
+      <div class="pipe-desc">Malicious log or ticket with IPI payload arrives</div>
     </div>
     <div class="pipe-step fu fd1">
-      <div class="pipe-icon">🤖</div>
+      <div class="pipe-icon">&#x1F916;</div>
       <div class="pipe-lbl">Blue Agent</div>
-      <div class="pipe-desc">LLM or deterministic investigator reads the incident</div>
+      <div class="pipe-desc">LLM analyzes evidence, gets tricked, proposes bad action</div>
     </div>
     <div class="pipe-step fu fd2">
-      <div class="pipe-icon">🚦</div>
+      <div class="pipe-icon">&#x1F6E1;&#xFE0F;</div>
       <div class="pipe-lbl">Policy Gate</div>
-      <div class="pipe-desc">4-layer deterministic enforcement</div>
+      <div class="pipe-desc">4 deterministic layers block unauthorized tool calls</div>
     </div>
     <div class="pipe-step fu">
-      <div class="pipe-icon">🧑‍⚖️</div>
+      <div class="pipe-icon">&#x1F9D1;&#x200D;&#x2696;&#xFE0F;</div>
       <div class="pipe-lbl">HITL</div>
       <div class="pipe-desc">Human approval for high-risk actions</div>
     </div>
     <div class="pipe-step fu fd1">
-      <div class="pipe-icon">📦</div>
+      <div class="pipe-icon">&#x1F4E6;</div>
       <div class="pipe-lbl">Sandbox</div>
       <div class="pipe-desc">Only verified actions reach mock IT env</div>
     </div>
     <div class="pipe-step fu fd2">
-      <div class="pipe-icon">📋</div>
+      <div class="pipe-icon">&#x1F4CB;</div>
       <div class="pipe-lbl">Audit Trail</div>
       <div class="pipe-desc">Append-only log + alerts</div>
     </div>
@@ -319,15 +320,15 @@ LANDING_HTML = r"""<!DOCTYPE html>
 <div id="integrations">
   <div class="int-lbl fu">Works with your stack</div>
   <div class="int-chips">
-    <div class="int-chip fu"><em>🧠</em> Google Gemini</div>
-    <div class="int-chip fu fd1"><em>🤖</em> OpenAI GPT-4</div>
-    <div class="int-chip fu fd2"><em>📧</em> Brevo Email</div>
-    <div class="int-chip fu"><em>📱</em> Telegram Bot</div>
-    <div class="int-chip fu fd1"><em>⚡</em> FastAPI + SSE</div>
-    <div class="int-chip fu fd2"><em>📊</em> Chart.js</div>
-    <div class="int-chip fu"><em>🔒</em> MITRE ATT&amp;CK</div>
-    <div class="int-chip fu fd1"><em>🐙</em> GitHub Actions CI</div>
-    <div class="int-chip fu fd2"><em>🐍</em> Python 3.11+</div>
+    <div class="int-chip fu">&#x1F9E0; Google Gemini</div>
+    <div class="int-chip fu fd1">&#x1F916; OpenAI GPT-4</div>
+    <div class="int-chip fu fd2">&#x1F4E7; Brevo Email</div>
+    <div class="int-chip fu">&#x1F4F1; Telegram Bot</div>
+    <div class="int-chip fu fd1">&#x26A1; FastAPI + SSE</div>
+    <div class="int-chip fu fd2">&#x1F4CA; Chart.js</div>
+    <div class="int-chip fu">&#x1F512; MITRE ATT&amp;CK</div>
+    <div class="int-chip fu fd1">&#x1F419; GitHub Actions CI</div>
+    <div class="int-chip fu fd2">&#x1F40D; Python 3.11+</div>
   </div>
 </div>
 
@@ -336,15 +337,15 @@ LANDING_HTML = r"""<!DOCTYPE html>
   <h2 class="fu">Ready to defend your AI?</h2>
   <p class="fu fd1">Launch the dashboard and run your first adversarial benchmark in seconds.</p>
   <div class="cta-btns fu fd2">
-    <a href="/dashboard" class="btn-primary">🚀 Enter Dashboard</a>
-    <a href="/docs" class="btn-secondary">📖 API Reference</a>
+    <a href="/dashboard" class="btn-primary">&#x1F680; Enter Dashboard</a>
+    <a href="/docs" class="btn-secondary">&#x1F4D6; API Reference</a>
   </div>
 </div>
 
 <!-- FOOTER -->
 <footer>
   <div class="foot-inner">
-    <span class="foot-copy">© 2025 AgentShield Arena · MIT License · 67 tests passing</span>
+    <span class="foot-copy">&copy; 2025 AgentShield Arena &middot; MIT License &middot; 67 tests passing</span>
     <div class="foot-links">
       <a href="/dashboard">Dashboard</a>
       <a href="/docs">API Docs</a>
@@ -355,98 +356,188 @@ LANDING_HTML = r"""<!DOCTYPE html>
 </footer>
 
 <script>
-// ── Image Sequence Scroll-Scrubber ────────────────────────────────────────────
-const TOTAL = 100;
-const BASE = '/hero/gemini_generated_video_8435859a_000/gemini_generated_video_8435859a_';
-const canvas = document.getElementById('hero-canvas');
-const ctx = canvas.getContext('2d');
-const images = new Array(TOTAL);
-let curFrame = 0;
+// ============================================================
+// HERO IMAGE-SEQUENCE SCROLL SCRUBBER
+// Key fixes vs broken version:
+//  1. html { scroll-behavior: auto } — smooth scroll breaks offsetTop math
+//  2. heroScroller.offsetTop used instead of getBoundingClientRect()
+//     so position is absolute in document, not relative to viewport
+//  3. Frame 0 rendered synchronously right after first image loads
+//  4. rAF throttle prevents jank from multiple scroll events per frame
+//  5. Prefetch 5 frames ahead of current position for smooth playback
+// ============================================================
 
+const TOTAL  = 100;
+const BASE   = '/hero/gemini_generated_video_8435859a_000/gemini_generated_video_8435859a_';
+const canvas = document.getElementById('hero-canvas');
+const ctx    = canvas.getContext('2d');
+const images = new Array(TOTAL).fill(null);
+let curFrame  = 0;
+let rafQueued = false;
+
+// Build URL for frame index i (zero-padded to 3 digits)
 function frameUrl(i) {
-  return BASE + String(i).padStart(3,'0') + '.jpg';
+  return BASE + String(i).padStart(3, '0') + '.jpg';
 }
-function resize() {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-  renderFrame(curFrame);
-}
-function renderFrame(idx) {
-  const img = images[idx];
+
+// Draw an image frame to canvas, cover-fitting to canvas dimensions
+function drawFrame(img) {
   if (!img || !img.complete || !img.naturalWidth) return;
   const cw = canvas.width, ch = canvas.height;
   const iw = img.naturalWidth, ih = img.naturalHeight;
-  const s = Math.max(cw/iw, ch/ih);
-  const dw = iw*s, dh = ih*s;
-  ctx.drawImage(img, (cw-dw)/2, (ch-dh)/2, dw, dh);
+  const s  = Math.max(cw / iw, ch / ih);
+  const dw = iw * s, dh = ih * s;
+  ctx.clearRect(0, 0, cw, ch);
+  ctx.drawImage(img, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
 }
-function preload() {
-  for (let i = 0; i < TOTAL; i++) {
-    const img = new Image();
-    img.onload = () => { if(i===0) renderFrame(0); };
-    img.src = frameUrl(i);
-    images[i] = img;
+
+// Render the current frame index if the image is ready
+function renderFrame(idx) {
+  const img = images[idx];
+  if (img && img.complete && img.naturalWidth) {
+    drawFrame(img);
   }
 }
-window.addEventListener('resize', resize, {passive:true});
+
+// Resize canvas to match window dimensions, then re-render current frame
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  renderFrame(curFrame);
+}
+
+// Start loading frame i; when done, re-render if it matches the current frame
+function loadFrame(i) {
+  if (i < 0 || i >= TOTAL) return;
+  if (images[i] && images[i].src) return; // already loading or loaded
+  const img = new Image();
+  img.onload = function() {
+    images[i] = img;
+    if (i === curFrame) renderFrame(i); // fill in if we're waiting
+  };
+  images[i] = img; // store reference before src triggers load
+  img.src = frameUrl(i);
+}
+
+// Preload strategy: frame 0 synchronously, then 1-9 eagerly, rest lazily
+function preload() {
+  const img0 = new Image();
+  img0.onload = function() {
+    images[0] = img0;
+    renderFrame(0);
+    for (let i = 1; i <= 9; i++) loadFrame(i);
+    setTimeout(function() {
+      for (let i = 10; i < TOTAL; i++) loadFrame(i);
+    }, 300);
+  };
+  img0.onerror = function() {
+    // Fallback dark background if images can't be fetched
+    ctx.fillStyle = '#070a13';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+  images[0] = img0;
+  img0.src = frameUrl(0);
+}
+
+window.addEventListener('resize', resize, { passive: true });
 resize();
 preload();
 
 // ── Scroll handler ────────────────────────────────────────────────────────────
 const heroScroller = document.getElementById('hero-scroller');
-const progressBar = document.getElementById('progress-bar');
-const scrollHint = document.getElementById('scroll-hint');
+const progressBar  = document.getElementById('progress-bar');
+const scrollHint   = document.getElementById('scroll-hint');
 
-window.addEventListener('scroll', () => {
-  // Global progress
-  const docH = document.documentElement.scrollHeight - window.innerHeight;
-  const globalPct = docH > 0 ? (window.scrollY / docH) * 100 : 0;
-  progressBar.style.width = globalPct + '%';
+function handleScroll() {
+  rafQueued = false;
 
-  // Hero image scrubbing
-  const rect = heroScroller.getBoundingClientRect();
-  const scrolled = -rect.top;
-  const total = heroScroller.clientHeight - window.innerHeight;
-  const frac = Math.max(0, Math.min(1, scrolled / total));
-  const frame = Math.min(TOTAL-1, Math.floor(frac * (TOTAL-1)));
-  if (frame !== curFrame) { curFrame = frame; renderFrame(frame); }
+  // Update global progress bar
+  const docScrollable = document.documentElement.scrollHeight - window.innerHeight;
+  progressBar.style.width = (docScrollable > 0 ? (window.scrollY / docScrollable) * 100 : 0) + '%';
 
-  // scroll hint fade
-  scrollHint.style.opacity = frac < 0.03 ? '1' : '0';
-}, {passive:true});
+  // Hero scrubbing:
+  // heroScroller.offsetTop = absolute Y position of scroller in document
+  // window.scrollY         = how far the page has been scrolled from top
+  // scrolled               = pixels user has scrolled past the hero start
+  // total                  = total scrollable height within the hero section
+  const heroTop    = heroScroller.offsetTop;
+  const heroHeight = heroScroller.offsetHeight;
+  const viewH      = window.innerHeight;
+  const scrolled   = window.scrollY - heroTop;
+  const total      = heroHeight - viewH;
 
-// ── Fade-up observer ──────────────────────────────────────────────────────────
-const obs = new IntersectionObserver(entries => {
-  entries.forEach(e => { if(e.isIntersecting) e.target.classList.add('in'); });
-}, {threshold: 0.12});
-document.querySelectorAll('.fu').forEach(el => obs.observe(el));
+  // frac: 0 when at top of hero, 1 when at bottom of hero
+  const frac  = total > 0 ? Math.max(0, Math.min(1, scrolled / total)) : 0;
+  const frame = Math.min(TOTAL - 1, Math.floor(frac * (TOTAL - 1)));
 
-// ── Stat counters ─────────────────────────────────────────────────────────────
-const statObs = new IntersectionObserver(entries => {
-  entries.forEach(e => {
-    if(e.isIntersecting && e.target.dataset.target) {
-      const t = parseInt(e.target.dataset.target);
+  if (frame !== curFrame) {
+    curFrame = frame;
+    // Pre-fetch the next 6 frames ahead so they are ready before we need them
+    for (let f = frame; f < Math.min(frame + 6, TOTAL); f++) loadFrame(f);
+    renderFrame(frame);
+  }
+
+  // Fade the scroll hint out after user starts scrolling
+  scrollHint.style.opacity = frac < 0.015 ? '1' : '0';
+}
+
+// Throttle scroll events to one per animation frame
+window.addEventListener('scroll', function() {
+  if (!rafQueued) {
+    rafQueued = true;
+    requestAnimationFrame(handleScroll);
+  }
+}, { passive: true });
+
+// Initialise on load (handles case where page reloads mid-scroll)
+window.addEventListener('load', handleScroll);
+handleScroll();
+
+// ── Smooth scroll for in-page nav links (JS-driven since CSS smooth is off) ──
+document.querySelectorAll('a[href^="#"]').forEach(function(a) {
+  a.addEventListener('click', function(e) {
+    const id = a.getAttribute('href').slice(1);
+    const el = document.getElementById(id);
+    if (!el) return;
+    e.preventDefault();
+    el.scrollIntoView({ behavior: 'smooth' });
+  });
+});
+
+// ── Fade-up IntersectionObserver ──────────────────────────────────────────────
+const fuObs = new IntersectionObserver(function(entries) {
+  entries.forEach(function(e) {
+    if (e.isIntersecting) e.target.classList.add('in');
+  });
+}, { threshold: 0.12 });
+document.querySelectorAll('.fu').forEach(function(el) { fuObs.observe(el); });
+
+// ── Stat counter animation ────────────────────────────────────────────────────
+const statObs = new IntersectionObserver(function(entries) {
+  entries.forEach(function(e) {
+    if (e.isIntersecting && e.target.dataset.target) {
+      const t     = parseInt(e.target.dataset.target, 10);
       const start = performance.now();
-      const dur = 1400;
+      const dur   = 1400;
       function tick(now) {
-        const p = Math.min((now-start)/dur, 1);
-        const ease = 1 - Math.pow(1-p, 3);
-        e.target.textContent = Math.floor(ease*t);
-        if(p<1) requestAnimationFrame(tick);
+        const p    = Math.min((now - start) / dur, 1);
+        const ease = 1 - Math.pow(1 - p, 3);
+        e.target.textContent = Math.floor(ease * t);
+        if (p < 1) requestAnimationFrame(tick);
         else e.target.textContent = t;
       }
       requestAnimationFrame(tick);
       statObs.unobserve(e.target);
     }
   });
-}, {threshold:0.5});
-document.querySelectorAll('.stat-num[data-target]').forEach(el => statObs.observe(el));
+}, { threshold: 0.5 });
+document.querySelectorAll('.stat-num[data-target]').forEach(function(el) { statObs.observe(el); });
 
-// ── Feature card glow ─────────────────────────────────────────────────────────
+// ── Feature card radial glow ──────────────────────────────────────────────────
 function cardGlow(e, card) {
   const r = card.getBoundingClientRect();
-  card.style.setProperty('--mx', ((e.clientX - r.left)/r.width*100)+'%');
-  card.style.setProperty('--my', ((e.clientY - r.top)/r.height*100)+'%');
+  card.style.setProperty('--mx', ((e.clientX - r.left) / r.width  * 100) + '%');
+  card.style.setProperty('--my', ((e.clientY - r.top)  / r.height * 100) + '%');
 }
 </script>
 </body>
