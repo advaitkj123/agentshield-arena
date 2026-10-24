@@ -54,10 +54,15 @@ except ImportError:
 
 # ── App Setup ───────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="AgentShield Arena Dashboard",
-    description="Real-time monitoring and control for adversarially resilient AI agents",
-    version="1.0.0"
+    title="AgentShield Arena",
+    description="Adversarially Resilient AI Security Platform",
+    version="2.0.0"
 )
+
+# Serve hero images as static files
+_hero_dir = os.path.join(os.path.dirname(__file__), "..", "hero")
+if os.path.isdir(_hero_dir):
+    app.mount("/hero", StaticFiles(directory=_hero_dir), name="hero")
 
 # In-memory event streams (per run_id → queue of SSE events)
 _event_queues: Dict[str, queue.Queue] = {}
@@ -76,75 +81,81 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     :root {
-      --bg-primary: #0a0e1a;
-      --bg-secondary: #111827;
-      --bg-card: #1a2236;
-      --bg-card-hover: #1f2a42;
-      --border: #243050;
-      --accent-blue: #3b82f6;
+      --bg-primary: #000;
+      --bg-secondary: #0d0d0d;
+      --bg-card: #111;
+      --bg-card-hover: #161616;
+      --border: rgba(255,255,255,0.08);
+      --accent-blue: #2997ff;
       --accent-cyan: #06b6d4;
-      --accent-green: #10b981;
-      --accent-red: #ef4444;
-      --accent-orange: #f59e0b;
-      --accent-purple: #8b5cf6;
-      --text-primary: #f1f5f9;
-      --text-secondary: #94a3b8;
-      --text-muted: #64748b;
-      --font-mono: 'JetBrains Mono', monospace;
-      --radius: 12px;
-      --radius-sm: 8px;
-      --shadow: 0 4px 24px rgba(0,0,0,0.4);
+      --accent-green: #30d158;
+      --accent-red: #ff453a;
+      --accent-orange: #ff9f0a;
+      --accent-purple: #bf5af2;
+      --text-primary: #f5f5f7;
+      --text-secondary: #86868b;
+      --text-muted: #424245;
+      --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --radius: 14px;
+      --radius-sm: 10px;
+      --shadow: 0 4px 32px rgba(0,0,0,0.7);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: 'Inter', sans-serif;
+      font-family: var(--font-sans);
       background: var(--bg-primary);
       color: var(--text-primary);
       min-height: 100vh;
     }
     /* ── Header ── */
     .header {
-      background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f2027 100%);
+      background: rgba(0,0,0,0.85);
       border-bottom: 1px solid var(--border);
-      padding: 0 32px;
+      padding: 0 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      height: 64px;
+      height: 52px;
       position: sticky;
       top: 0;
       z-index: 100;
-      backdrop-filter: blur(12px);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
     }
     .header-logo {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
+      text-decoration: none;
     }
     .shield-icon {
-      width: 36px; height: 36px;
-      background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-      border-radius: 10px;
+      width: 30px; height: 30px;
+      background: linear-gradient(135deg, #2997ff, #06b6d4);
+      border-radius: 8px;
       display: flex; align-items: center; justify-content: center;
-      font-size: 18px;
+      font-size: 15px;
     }
-    .header-title { font-size: 18px; font-weight: 700; }
-    .header-subtitle { font-size: 12px; color: var(--text-secondary); }
+    .header-title { font-size: 15px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.3px; }
+    .header-subtitle { font-size: 11px; color: var(--text-secondary); }
     .header-badge {
-      background: linear-gradient(135deg, #065f46, #047857);
-      border: 1px solid #10b981;
+      background: rgba(48,209,88,0.12);
+      border: 1px solid rgba(48,209,88,0.3);
       border-radius: 20px;
       padding: 4px 12px;
       font-size: 11px;
       font-weight: 600;
-      color: #6ee7b7;
-      letter-spacing: 0.05em;
+      color: #30d158;
+      letter-spacing: 0.04em;
     }
+    .header-right { display:flex; align-items:center; gap:12px; }
+    .header-home-link { font-size:13px; color:var(--text-secondary); text-decoration:none; transition:color 0.2s; }
+    .header-home-link:hover { color:#2997ff; }
     /* ── Layout ── */
     .main-layout {
       display: grid;
-      grid-template-columns: 280px 1fr;
-      height: calc(100vh - 64px);
+      grid-template-columns: 260px 1fr;
+      height: calc(100vh - 52px);
     }
     /* ── Sidebar ── */
     .sidebar {
@@ -427,14 +438,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <header class="header">
-    <div class="header-logo">
+    <a class="header-logo" href="/">
       <div class="shield-icon">🛡️</div>
       <div>
         <div class="header-title">AgentShield Arena</div>
-        <div class="header-subtitle">Adversarially Resilient AI Agents for IT Incident Response</div>
+        <div class="header-subtitle">Security Operations Dashboard</div>
       </div>
-    </div>
-    <div style="display:flex;align-items:center;gap:16px;">
+    </a>
+    <div class="header-right">
+      <a href="/" class="header-home-link">← Home</a>
       <div class="status-row">
         <div class="status-dot idle" id="globalStatusDot"></div>
         <span id="globalStatusText" style="font-size:13px;color:var(--text-secondary)">Ready</span>
@@ -468,8 +480,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span class="nav-icon">📈</span> Multi-Scenario Benchmark
       </div>
       <div class="sidebar-section-label">Documentation</div>
-      <div class="nav-item" onclick="window.open('/api/docs','_blank')">
+      <div class="nav-item" onclick="window.open('/docs','_blank')">
         <span class="nav-icon">📄</span> API Reference
+      </div>
+      <div class="sidebar-section-label">Integrations</div>
+      <div class="nav-item" onclick="showView('integrations')" id="nav-integrations">
+        <span class="nav-icon">🔗</span> Alerts & AI Advisor
+      </div>
+      <div style="margin-top:auto;padding:12px 8px;">
+        <a href="/" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);text-decoration:none;padding:8px;border-radius:8px;transition:all 0.2s;" onmouseover="this.style.color='#2997ff'" onmouseout="this.style.color='var(--text-muted)'">
+          ← Back to Landing Page
+        </a>
       </div>
     </nav>
 
@@ -737,6 +758,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      </div>
+
       <!-- ── Benchmark View ── -->
       <div class="view" id="view-benchmark">
         <div>
@@ -754,7 +777,85 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- ── Integrations View ── -->
+      <div class="view" id="view-integrations">
+        <div>
+          <div class="section-title">🔗 Integrations & AI Advisor</div>
+          <div class="section-subtitle">Manage external integrations, test notifications, and chat with the AI Security Advisor</div>
+        </div>
+
+        <!-- Integration status cards -->
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;">
+          <div class="card" id="gemini-status-card">
+            <div class="card-title">🤖 Gemini AI Advisor</div>
+            <div id="geminiStatusBadge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(255,149,10,0.12);color:#ff9f0a;border:1px solid rgba(255,149,10,0.3);margin-bottom:12px;">Checking...</div>
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Powered by Google Gemini 2.0 Flash. Answers questions about incidents, policy decisions, DLP violations.</div>
+            <button class="btn btn-primary" onclick="checkIntegrationStatus()" style="width:100%;">↻ Refresh Status</button>
+          </div>
+          <div class="card">
+            <div class="card-title">📧 Brevo Email Alerts</div>
+            <div id="brevoStatusBadge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(255,149,10,0.12);color:#ff9f0a;border:1px solid rgba(255,149,10,0.3);margin-bottom:12px;">Checking...</div>
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Sends welcome, security alert, HITL approval, and benchmark report emails via Brevo API.</div>
+            <button class="btn" onclick="testEmail()" style="width:100%;background:var(--bg-primary);border:1px solid var(--border);">📧 Send Test Email</button>
+          </div>
+          <div class="card">
+            <div class="card-title">📱 Telegram Bot Alerts</div>
+            <div id="telegramStatusBadge" style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(255,149,10,0.12);color:#ff9f0a;border:1px solid rgba(255,149,10,0.3);margin-bottom:12px;">Checking...</div>
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Real-time push alerts for policy blocks, DLP violations, and HITL requests via Telegram Bot API.</div>
+            <button class="btn" onclick="testTelegram()" style="width:100%;background:var(--bg-primary);border:1px solid var(--border);">📱 Send Test Message</button>
+          </div>
+        </div>
+
+        <!-- Inline AI Chat panel -->
+        <div class="card" style="margin-top:0;">
+          <div class="card-title">🤖 AI Security Advisor — Chat</div>
+          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">Ask the Gemini-powered advisor about incidents, policy decisions, DLP violations, or general cybersecurity questions.</div>
+          <div id="inlineChatMessages" style="height:320px;overflow-y:auto;background:var(--bg-primary);border-radius:10px;border:1px solid var(--border);padding:16px;display:flex;flex-direction:column;gap:12px;margin-bottom:12px;">
+            <div style="align-self:flex-start;max-width:85%;">
+              <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;border-bottom-left-radius:4px;padding:10px 14px;font-size:13px;color:var(--text-primary);line-height:1.6;">
+                👋 Hi! I'm your AI Security Advisor.<br/>Ask me about incidents, policy decisions, DLP violations, evaluation metrics, or any cybersecurity question.
+              </div>
+            </div>
+          </div>
+
+          <!-- Suggestion chips -->
+          <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+            <button onclick="inlineSuggest('Explain how the four-layer Policy Gate works')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">Policy Gate</button>
+            <button onclick="inlineSuggest('What are the 7 evaluation metrics and what do they measure?')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">Metrics</button>
+            <button onclick="inlineSuggest('How does DLP inspection detect credential exfiltration?')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">DLP</button>
+            <button onclick="inlineSuggest('What MITRE ATT&CK techniques are covered by the adversarial scenarios?')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">MITRE</button>
+            <button onclick="inlineSuggest('Describe the Human-in-the-Loop approval workflow')" style="background:var(--bg-card);border:1px solid var(--border);border-radius:20px;color:var(--text-secondary);font-size:11px;padding:5px 12px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#2997ff';this.style.color='#2997ff'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-secondary)'">HITL</button>
+          </div>
+
+          <div style="display:flex;gap:10px;">
+            <textarea id="inlineChatInput" placeholder="Ask about incidents, policies, DLP, metrics..." rows="1"
+              style="flex:1;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;color:var(--text-primary);font-size:13px;padding:10px 14px;outline:none;resize:none;font-family:var(--font-sans);transition:border-color 0.2s;max-height:100px;"
+              onfocus="this.style.borderColor='#2997ff'" onblur="this.style.borderColor='var(--border)'"
+              oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendInlineChat();}"></textarea>
+            <button onclick="sendInlineChat()" id="inlineChatSendBtn"
+              style="background:linear-gradient(135deg,#2997ff,#06b6d4);border:none;border-radius:10px;color:#fff;font-size:16px;padding:10px 18px;cursor:pointer;transition:opacity 0.2s;white-space:nowrap;">Send ➤</button>
+          </div>
+        </div>
+
+        <!-- Telegram setup guide -->
+        <div class="card">
+          <div class="card-title">📱 Telegram Setup Guide</div>
+          <div style="font-size:13px;color:var(--text-secondary);line-height:1.8;">
+            <p><strong style="color:var(--text-primary);">Step 1:</strong> Search for your bot on Telegram and send <code style="background:var(--bg-primary);padding:2px 6px;border-radius:4px;">/start</code></p>
+            <p><strong style="color:var(--text-primary);">Step 2:</strong> Click the button below to auto-register your chat ID</p>
+            <p><strong style="color:var(--text-primary);">Step 3:</strong> All future alerts will be sent to your Telegram automatically</p>
+          </div>
+          <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;">
+            <button class="btn btn-primary" onclick="pollTelegramUpdates()">🔄 Register via /start</button>
+            <div id="telegramPollResult" style="font-size:13px;color:var(--text-secondary);align-self:center;"></div>
+          </div>
+        </div>
+
+      </div>
+
     </main>
+
   </div>
 
   <script>
@@ -769,12 +870,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function showView(name) {
       document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
       document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-      document.getElementById('view-' + name).classList.add('active');
-      document.getElementById('nav-' + name).classList.add('active');
+      const vEl = document.getElementById('view-' + name);
+      const nEl = document.getElementById('nav-' + name);
+      if (vEl) vEl.classList.add('active');
+      if (nEl) nEl.classList.add('active');
       if (name === 'audit') loadAuditTrail();
       if (name === 'policy') loadPolicyConfig();
       if (name === 'dlp') loadDLPPatterns();
+      if (name === 'integrations') checkIntegrationStatus();
     }
+
 
     // ── Scenario Execution ─────────────────────────────────────────────────
     async function runScenario() {
@@ -1188,10 +1293,134 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('execStatusText').textContent = text;
     }
 
+    // ── Integrations ──────────────────────────────────────────────────────────
+    async function checkIntegrationStatus() {
+      try {
+        const resp = await fetch('/api/integrations/status');
+        const data = await resp.json();
+
+        function badge(ok, label) {
+          const color = ok ? '#30d158' : '#ff453a';
+          const bg = ok ? 'rgba(48,209,88,0.12)' : 'rgba(255,69,58,0.12)';
+          const border = ok ? 'rgba(48,209,88,0.3)' : 'rgba(255,69,58,0.3)';
+          const icon = ok ? '✅' : '❌';
+          return `<div style="display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:${bg};color:${color};border:1px solid ${border};">${icon} ${label}</div>`;
+        }
+
+        const gemini = data.gemini_ai || {};
+        const brevo = data.brevo_email || {};
+        const tg = data.telegram || {};
+
+        document.getElementById('geminiStatusBadge').outerHTML = badge(gemini.configured, gemini.configured ? `Active — ${gemini.model}` : 'Not Configured');
+        document.getElementById('brevoStatusBadge').outerHTML = badge(brevo.configured, brevo.configured ? `Active — ${(brevo.admin_emails||[]).join(', ') || 'No emails set'}` : 'Not Configured');
+        document.getElementById('telegramStatusBadge').outerHTML = badge(tg.configured, tg.configured ? `Active — ${tg.chat_ids_count} chat(s)` : 'Not Configured');
+      } catch(e) {
+        console.error('Integration status check failed:', e);
+      }
+    }
+
+    async function testEmail() {
+      const resp = await fetch('/api/notify/test-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+      const data = await resp.json();
+      alert(data.message || (data.success ? 'Email sent!' : 'Email failed — check BREVO_API_KEY and ADMIN_EMAILS in .env'));
+    }
+
+    async function testTelegram() {
+      const resp = await fetch('/api/notify/test-telegram', {method:'POST'});
+      const data = await resp.json();
+      alert(data.message || (data.success ? `Telegram sent to ${data.chats_reached} chat(s)!` : 'Failed — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in .env'));
+    }
+
+    async function pollTelegramUpdates() {
+      const el = document.getElementById('telegramPollResult');
+      el.textContent = '⏳ Polling for /start messages...';
+      try {
+        const resp = await fetch('/api/notify/telegram/updates');
+        const data = await resp.json();
+        if (data.new_chats_registered && data.new_chats_registered.length > 0) {
+          el.textContent = `✅ Registered ${data.new_chats_registered.length} new chat(s): ${data.new_chats_registered.join(', ')}`;
+          el.style.color = '#30d158';
+        } else {
+          el.textContent = `ℹ️ ${data.updates} update(s) found — no new /start commands. Send /start to your bot first.`;
+          el.style.color = 'var(--text-secondary)';
+        }
+      } catch(e) {
+        el.textContent = '❌ Poll failed: ' + e.message;
+        el.style.color = '#ff453a';
+      }
+    }
+
+    // ── Inline Chat (Integrations panel) ─────────────────────────────────────
+    let inlineChatTyping = null;
+
+    function addInlineMsg(role, text) {
+      const wrap = document.getElementById('inlineChatMessages');
+      if (inlineChatTyping && wrap.contains(inlineChatTyping)) {
+        wrap.removeChild(inlineChatTyping);
+        inlineChatTyping = null;
+      }
+      const div = document.createElement('div');
+      div.style.cssText = `align-self:${role==='user'?'flex-end':'flex-start'};max-width:88%;`;
+      const bg = role === 'user'
+        ? 'background:linear-gradient(135deg,#1d4ed8,#0369a1);color:#fff;border-bottom-right-radius:4px;'
+        : 'background:var(--bg-card);border:1px solid var(--border);color:var(--text-primary);border-bottom-left-radius:4px;';
+      div.innerHTML = `<div style="${bg}border-radius:12px;padding:10px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>')}</div>`;
+      wrap.appendChild(div);
+      wrap.scrollTop = wrap.scrollHeight;
+    }
+
+    function showInlineTyping() {
+      const wrap = document.getElementById('inlineChatMessages');
+      const div = document.createElement('div');
+      div.style.cssText = 'align-self:flex-start;';
+      div.innerHTML = `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;border-bottom-left-radius:4px;padding:10px 16px;display:flex;gap:5px;align-items:center;">
+        <span style="width:7px;height:7px;background:#2997ff;border-radius:50%;animation:bounce 1.2s infinite;display:inline-block;"></span>
+        <span style="width:7px;height:7px;background:#2997ff;border-radius:50%;animation:bounce 1.2s infinite 0.2s;display:inline-block;"></span>
+        <span style="width:7px;height:7px;background:#2997ff;border-radius:50%;animation:bounce 1.2s infinite 0.4s;display:inline-block;"></span>
+      </div>`;
+      wrap.appendChild(div);
+      inlineChatTyping = div;
+      wrap.scrollTop = wrap.scrollHeight;
+    }
+
+    async function sendInlineChat() {
+      const input = document.getElementById('inlineChatInput');
+      const msg = input.value.trim();
+      if (!msg) return;
+      input.value = '';
+      input.style.height = 'auto';
+      document.getElementById('inlineChatSendBtn').disabled = true;
+
+      addInlineMsg('user', msg);
+      showInlineTyping();
+
+      try {
+        const resp = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({message: msg})
+        });
+        const data = await resp.json();
+        addInlineMsg('ai', data.response || 'No response received.');
+      } catch(e) {
+        addInlineMsg('ai', '⚠️ Connection error. Please try again.');
+      } finally {
+        document.getElementById('inlineChatSendBtn').disabled = false;
+        input.focus();
+      }
+    }
+
+    function inlineSuggest(text) {
+      document.getElementById('inlineChatInput').value = text;
+      sendInlineChat();
+    }
+
     // Init
     loadAuditTrail();
     initChatbot();
+    checkIntegrationStatus();
   </script>
+
 
   <!-- ── AI Security Advisor Chatbot ─────────────────────────────────── -->
   <style>
@@ -1520,6 +1749,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
+    """Apple-style cinematic landing page."""
+    try:
+        from src.landing import LANDING_HTML
+        return HTMLResponse(LANDING_HTML)
+    except ImportError:
+        # Fallback if landing module unavailable
+        return HTMLResponse('<meta http-equiv="refresh" content="0;url=/dashboard">')
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    """Main security operations dashboard."""
     return HTMLResponse(DASHBOARD_HTML)
 
 
