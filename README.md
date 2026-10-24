@@ -35,9 +35,9 @@ The central contribution is architectural: **separating non-deterministic LLM re
 | **Threat Score** | Continuous 0.0–1.0 risk score per run (weighted: UAER + DLP + FBR) | ✅ Implemented |
 | **Automated Benchmarker** | Runs all 6 scenarios, aggregates defended vs. unsafe metrics | ✅ Implemented |
 | **Interactive Dashboard** | FastAPI + SSE + Chart.js real-time monitoring UI | ✅ Implemented |
-| **🤖 Gemini AI Security Advisor** | Floating chatbot widget powered by Gemini 2.0 Flash — explains decisions, analyzes incidents, multi-turn context | ✅ **NEW** |
-| **📧 Brevo Email Alerts** | Automated transactional emails for policy blocks, DLP violations, HITL requests, benchmark summaries | ✅ **NEW** |
-| **📱 Telegram Bot Alerts** | Real-time push notifications to Telegram for every critical security event | ✅ **NEW** |
+| **Gemini AI Security Advisor** | Floating chatbot widget powered by Gemini 2.0 Flash — explains decisions, analyzes incidents, multi-turn context | ✅ **NEW** |
+| ** Brevo Email Alerts** | Automated transactional emails for policy blocks, DLP violations, HITL requests, benchmark summaries | ✅ **NEW** |
+| ** Telegram Bot Alerts** | Real-time push notifications to Telegram for every critical security event | ✅ **NEW** |
 | **67 Passing Tests** | Unit + integration + DLP + benchmark + advisory tests | ✅ **67/67** |
 | **GitHub Actions CI** | Automated test + DLP + gate verification on every push | ✅ Implemented |
 | **Zero External Dependencies** | Entire test suite runs offline with stdlib only | ✅ Implemented |
@@ -46,7 +46,7 @@ The central contribution is architectural: **separating non-deterministic LLM re
 | **MITRE ATT&CK Mapping** | Every scenario mapped to specific ATT&CK technique IDs | ✅ Implemented |
 | **OWASP LLM Top 10** | Each attack scenario tagged to OWASP LLM Top 10 2025 risk | ✅ Implemented |
 
-### 🏆 Judging Criteria Alignment
+###  Judging Criteria Alignment
 
 | Criterion | How AgentShield Arena Delivers |
 | :--- | :--- |
@@ -461,13 +461,13 @@ http://localhost:8000
 ```
 
 **Features:**
-- 📊 **Metrics Dashboard** — Live TCR, UAER, ASR, FBR, ACR, MTTD, ThreatScore with radar and bar charts
-- ▶️ **Scenario Runner** — Execute any of 6 scenarios; watch events stream live via SSE
-- 🔍 **DLP Pattern Tester** — Test any argument value against all 13 DLP patterns interactively
-- 🔐 **Policy Gate Viewer** — Browse the entire tool registry with risk levels and auth requirements
-- 📋 **Audit Trail Browser** — Filter, search, and inspect the structured JSONL audit trail
-- 📈 **Benchmark View** — Run multi-scenario battery and view comparative results in-browser
-- ⚠️ **HITL Approval Panel** — Interactive operator approval for high-impact actions
+-  **Metrics Dashboard** — Live TCR, UAER, ASR, FBR, ACR, MTTD, ThreatScore with radar and bar charts
+-  **Scenario Runner** — Execute any of 6 scenarios; watch events stream live via SSE
+-  **DLP Pattern Tester** — Test any argument value against all 13 DLP patterns interactively
+-  **Policy Gate Viewer** — Browse the entire tool registry with risk levels and auth requirements
+-  **Audit Trail Browser** — Filter, search, and inspect the structured JSONL audit trail
+-  **Benchmark View** — Run multi-scenario battery and view comparative results in-browser
+-  **HITL Approval Panel** — Interactive operator approval for high-impact actions
 
 ---
 
@@ -479,10 +479,6 @@ http://localhost:8000
 4. **No Jailbreak Research:** The adversarial payloads are representative examples of real-world injection patterns, not optimized adversarial suffixes from automated red-teaming.
 
 ---
-
-## 17. License
-
-MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
